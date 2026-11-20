@@ -1,12 +1,13 @@
-"""wick worker：单进程串行消费 events 表。
+"""wick worker: single-process, serial consumer of the events table.
 
-一个 inbox 一个活跃 worker（上游建议）。串行不是保守，是为了不让两个 run
-改同一批文件；真要并行时按 source_type 分片，不是在这里加线程。
+One active worker per inbox (upstream advice). Serial is not conservatism: two
+concurrent runs would touch the same files. Real parallelism means sharding by
+source_type, not adding threads here.
 
-用法：
-    python worker.py --once        # 处理完当前所有 pending 就退出（测试/兜底）
-    python worker.py               # 常驻，5 秒轮询
-    python worker.py --selftest    # 自检
+Usage:
+    python worker.py --once        # drain the current queue, then exit
+    python worker.py               # stay resident, poll every 5s
+    python worker.py --selftest    # self-check
 """
 from __future__ import annotations
 
@@ -23,14 +24,14 @@ import db  # noqa: E402
 
 log = logging.getLogger("wick.worker")
 
-POLL_INTERVAL = 5  # 秒
+POLL_INTERVAL = 5  # seconds
 
 
 def handle(event) -> str:
-    """处理一条事件，返回要投递的文本。
+    """Process one event and return the text to deliver.
 
-    D1：占位，只回声，用来验证「进 → 处理 → 出」这条链路。
-    D3：换成通过 gateway RPC 起一次 run，把 run 的输出摘要返回。
+    D1: placeholder that only echoes, used to prove the in -> process -> out path.
+    D3: replaced by a real agent run via the Hermes CLI or gateway RPC.
     """
     payload = json.loads(event["payload"] or "{}")
     title = payload.get("title") or payload.get("text") or "(无标题)"
@@ -38,7 +39,7 @@ def handle(event) -> str:
 
 
 def run_once(conn) -> int:
-    """处理直到队列空，返回处理条数。"""
+    """Drain the queue, returning how many events were processed."""
     processed = 0
     while True:
         ev = db.claim_next(conn)
@@ -46,7 +47,7 @@ def run_once(conn) -> int:
             return processed
         try:
             text = handle(ev)
-        except Exception as exc:  # 单条失败不能拖垮整个 worker
+        except Exception as exc:  # one bad event must not take the worker down
             log.exception("事件 %s 处理失败", ev["id"])
             db.finish_event(conn, ev["id"], "failed", repr(exc))
             db.add_delivery(conn, ev["id"], f"处理失败：{ev['source_type']}:{ev['source_id']} — {exc!r}")
@@ -58,7 +59,7 @@ def run_once(conn) -> int:
 
 
 def serve(conn, interval: int = POLL_INTERVAL) -> None:
-    """常驻循环。SIGTERM/SIGINT 时干净退出，把手上的事件交还队列。"""
+    """Resident loop. Exits cleanly on SIGTERM/SIGINT."""
     stopping = {"flag": False}
 
     def _stop(signum, _frame):
@@ -68,7 +69,7 @@ def serve(conn, interval: int = POLL_INTERVAL) -> None:
     signal.signal(signal.SIGINT, _stop)
     signal.signal(signal.SIGTERM, _stop)
 
-    n = db.requeue_stale(conn)  # 上次崩溃留下的 running 放回队列
+    n = db.requeue_stale(conn)  # recover rows a previous crash left running
     if n:
         log.warning("恢复了 %s 条残留的 running 事件", n)
 
@@ -80,19 +81,19 @@ def serve(conn, interval: int = POLL_INTERVAL) -> None:
     log.info("worker 退出")
 
 
-# --------------------------------------------------------------- selftest
+# ---------------------------------------------------------------- selftest
 
 def _selftest() -> int:
-    """自检：进 → 处理 → 出 全链路，含去重与失败隔离。"""
+    """Self-check: full in -> process -> out path, plus dedupe and failure isolation."""
     conn = db.connect(":memory:")
 
-    # 两条真事件 + 一条重复
+    # Two real events plus one duplicate.
     db.enqueue(conn, "github_issue", "cmyyy/wick#1", {"title": "断点续跑失败"})
     db.enqueue(conn, "github_issue", "cmyyy/wick#2", {"title": "outbox 节流算错"})
-    db.enqueue(conn, "github_issue", "cmyyy/wick#1", {"title": "断点续跑失败"})  # 重复
+    db.enqueue(conn, "github_issue", "cmyyy/wick#1", {"title": "断点续跑失败"})  # duplicate
 
     n = run_once(conn)
-    assert n == 2, n  # 重复那条被去重，不处理
+    assert n == 2, n  # the duplicate never reaches handle()
 
     rows = conn.execute("SELECT status, COUNT(*) c FROM events GROUP BY status").fetchall()
     assert {r["status"]: r["c"] for r in rows} == {"done": 2}, rows
@@ -101,10 +102,11 @@ def _selftest() -> int:
     assert len(deliveries) == 2, deliveries
     assert "断点续跑失败" in deliveries[0]["body"], deliveries[0]["body"]
 
-    # 队列空了再跑不做事
+    # An empty queue does nothing.
     assert run_once(conn) == 0
 
-    # 失败隔离：handle 抛异常时事件标 failed、仍产出投递、worker 不挂
+    # Failure isolation: a raising handle() marks the event failed, still emits a
+    # delivery, and leaves the worker running.
     global handle
     original = handle
 
@@ -114,7 +116,7 @@ def _selftest() -> int:
     handle = boom
     try:
         db.enqueue(conn, "manual", "fail-1", {"title": "会失败的那条"})
-        assert run_once(conn) == 0  # 失败不计入 processed
+        assert run_once(conn) == 0  # failures do not count as processed
     finally:
         handle = original
 

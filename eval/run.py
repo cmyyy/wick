@@ -1,20 +1,21 @@
 #!/usr/bin/env python3
-"""Code Agent 评测评分器（v1.2）
+"""Hard-metric grader for wick's own agent runs (v1.2).
 
-只做**能自动算的硬指标**，rubric 打分 / judge 校准另做。
+Only computes what can be automated; rubric scoring and judge calibration are
+handled separately.
 
-用法：
+Usage:
   python run.py --repo D:/AI/hermes-agent --worktree D:/tmp/wt --base main
-  python run.py --selftest          # 自检
+  python run.py --selftest          # self-check
 
-输出：JSON 报告（stdout + eval/reports/<时间戳>.json）
+Output: a JSON report (stdout plus eval/reports/<timestamp>.json).
 
-指标口径（对应 PROCESS.md v1.2）：
-  - regression_failed : 原有测试是否有回归（红线：必须为空）
-  - tests             : 通过/失败数
-  - diff              : 改动文件、增删行数、是否碰到测试文件
-  - hallucinated      : 报告里提到但仓库中不存在的文件/符号（红线：<2%）
-  - trajectory        : edits_per_failure 等轨迹指标（需会话日志，第一版留接口）
+Metric definitions (see docs/PROCESS-code-agent-v1.2.md):
+  - regression_failed : pre-existing tests broken by the change (red line: must be empty)
+  - tests             : pass/fail counts
+  - diff              : changed files, added/removed lines, whether tests were touched
+  - hallucinated      : files named in the writeup that do not exist in the repo (red line: <2%)
+  - trajectory        : edits_per_failure and friends; needs a session log, stubbed for now
 """
 from __future__ import annotations
 
@@ -29,7 +30,7 @@ from pathlib import Path
 
 
 def _run(cmd: list[str], cwd: Path | str, timeout: int = 600) -> tuple[int, str]:
-    """跑命令，返回 (returncode, 合并输出)。不抛异常，失败也返回。"""
+    """Run a command, returning (returncode, combined output). Never raises."""
     try:
         p = subprocess.run(cmd, cwd=str(cwd), capture_output=True, text=True,
                            timeout=timeout, encoding="utf-8", errors="replace")
@@ -40,7 +41,8 @@ def _run(cmd: list[str], cwd: Path | str, timeout: int = 600) -> tuple[int, str]
         return 127, f"command not found: {cmd[0]}"
 
 
-# 构建/缓存的产物不算"改动"（真实仓库通常有 .gitignore，这里再兜一层）
+# Build and cache artifacts are not "changes". Real repos have a .gitignore for
+# this, but the grader also runs on throwaway repos, so filter here as well.
 _NOISE = re.compile(
     r"(^|/)(__pycache__|\.pytest_cache|\.mypy_cache|\.ruff_cache|node_modules|\.venv|venv|dist|build|\.tox)/"
     r"|\.(pyc|pyo|log|tmp|swp)$"
@@ -48,7 +50,7 @@ _NOISE = re.compile(
 
 
 def diff_stats(worktree: Path, base: str = "main") -> dict:
-    """改动统计：文件清单、增删行数（含未跟踪的新文件）。"""
+    """Change stats: file list and line counts, including untracked new files."""
     rc, out = _run(["git", "diff", "--numstat", base], worktree)
     if rc != 0:
         rc, out = _run(["git", "diff", "--numstat", "HEAD"], worktree)
@@ -62,7 +64,7 @@ def diff_stats(worktree: Path, base: str = "main") -> dict:
         added += int(a) if a.isdigit() else 0
         removed += int(r) if r.isdigit() else 0
 
-    # 未跟踪的新文件（git diff 不显示，但 agent 新建的文件必须算改动）
+    # Untracked new files: git diff ignores them, but files an agent created are changes.
     rc_u, out_u = _run(["git", "ls-files", "--others", "--exclude-standard"], worktree)
     if rc_u == 0:
         for name in [x for x in out_u.strip().splitlines() if x.strip()]:
@@ -84,7 +86,11 @@ def diff_stats(worktree: Path, base: str = "main") -> dict:
 
 
 def run_tests(worktree: Path, python_exe: str = sys.executable, timeout: int = 900) -> dict:
-    """跑 pytest，解析结果。pytest 缺失或跑不起来时明确标记 unavailable，不能伪装成 0 失败。"""
+    """Run pytest and parse the result.
+
+    A missing pytest or an empty collection is reported as unavailable: silently
+    returning 0 failed would look like a pass and turn a red line into a false green.
+    """
     rc, out = _run([python_exe, "-m", "pytest", "-q", "--tb=no"], worktree, timeout=timeout)
 
     if "No module named pytest" in out or rc == 127:
@@ -101,7 +107,7 @@ def run_tests(worktree: Path, python_exe: str = sys.executable, timeout: int = 9
     m = re.search(r"(\d+) failed", out)
     if m:
         failed = int(m.group(1))
-    # 一条测试都没收集到，也算不可用（否则"0 失败"会被误判成通过）
+    # Zero collected tests also counts as unavailable; "0 failed" must not read as a pass.
     if passed == 0 and failed == 0:
         return {"available": False, "reason": "没有收集到任何测试用例", "exit_code": rc,
                 "raw_tail": out.strip().splitlines()[-5:]}
@@ -117,13 +123,13 @@ def run_tests(worktree: Path, python_exe: str = sys.executable, timeout: int = 9
 
 
 def extract_mentions(text: str) -> list[str]:
-    """从 agent 的说明文字里提取它声称改过/引用过的文件路径。"""
+    """Extract file paths the writeup claims to have changed or read."""
     pat = r"[\w./-]+\.(?:py|js|ts|md|yaml|yml|json|toml)"
     return sorted(set(re.findall(pat, text)))
 
 
 def hallucination_check(text: str, repo: Path) -> dict:
-    """幻觉检测：它提到的文件是否真实存在。"""
+    """Hallucination check: do the named files actually exist?"""
     mentions = extract_mentions(text)
     missing = [m for m in mentions if not (repo / m).exists()]
     return {
@@ -134,9 +140,9 @@ def hallucination_check(text: str, repo: Path) -> dict:
 
 
 def trajectory_from_log(log_path: Path | None) -> dict:
-    """轨迹指标。第一版留接口：需要会话日志里每步的动作序列。
+    """Trajectory metrics. Stub for v1: needs a per-step action sequence.
 
-    会话日志格式未定时返回 null，等接入 Hermes session log 后填。
+    Returns unavailable until the Hermes session-log parser lands.
     """
     if not log_path or not Path(log_path).exists():
         return {"available": False, "note": "需要会话日志（每步动作序列），待接入"}
@@ -155,7 +161,7 @@ def grade(repo: Path, worktree: Path, base: str, answer_text: str = "",
         "hallucination": hallucination_check(answer_text, repo) if answer_text else None,
         "trajectory": trajectory_from_log(log_path),
     }
-    # 红线判定
+    # Red-line evaluation.
     report["red_lines"] = {
         "tests_unavailable": not report["tests"].get("available", False),
         "regression_failed": report["tests"].get("failed", 0) > 0,
@@ -166,7 +172,7 @@ def grade(repo: Path, worktree: Path, base: str, answer_text: str = "",
 
 
 def selftest() -> int:
-    """自检：临时 git repo 上验 diff_stats 与幻觉检测。"""
+    """Self-check: diff_stats and hallucination detection against a throwaway git repo."""
     with tempfile.TemporaryDirectory() as td:
         repo = Path(td)
         _run(["git", "init", "-q", "-b", "main"], repo)
@@ -176,7 +182,7 @@ def selftest() -> int:
         _run(["git", "add", "."], repo)
         _run(["git", "commit", "-qm", "init"], repo)
 
-        # 改一个文件
+        # Modify one tracked file.
         (repo / "a.py").write_text("x = 2\ny = 3\n", encoding="utf-8")
         st = diff_stats(repo, "HEAD")
         assert st["file_count"] == 1, st
@@ -184,12 +190,12 @@ def selftest() -> int:
         assert st["lines_added"] == 2 and st["lines_removed"] == 1, st
         assert st["touched_tests"] is False, st
 
-        # 碰测试文件
+        # Touch a test file.
         (repo / "test_a.py").write_text("def test_x(): assert True\n", encoding="utf-8")
         st2 = diff_stats(repo, "HEAD")
         assert st2["touched_tests"] is True, st2
 
-        # 幻觉检测
+        # Hallucination detection.
         h = hallucination_check("改了 a.py 和 b.py，还看了 nope/c.py", repo)
         assert h["mentions"] == 3, h
         assert sorted(h["missing"]) == ["b.py", "nope/c.py"], h

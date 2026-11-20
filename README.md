@@ -116,6 +116,13 @@ wick/
 
 ---
 
+## 代码约定
+
+- **注释和 docstring 一律英文**，包括行内注释和模块说明。代码是给所有读者看的，中文注释会把非中文读者挡在外面。
+- **面向用户的字符串保持中文**：投递内容、错误提示、CLI `--help`、日志消息。这些是产品文案，不是代码注释。
+- **一个 inbox 只允许一个活跃 worker**（见 `DECISIONS.md` #5）。要并行就按 `source_type` 分片，不要在 worker 里加线程。
+- **每个非平凡模块留一个 `--selftest`**，用 `assert` 断言，不引入测试框架。跑法：`python src/db.py`、`python src/worker.py --selftest`、`python src/sources/github.py`、`python eval/run.py --selftest`。
+
 ## 状态
 
 MVP 开发中。里程碑见 [ROADMAP.md](./ROADMAP.md)。

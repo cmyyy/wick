@@ -1,12 +1,16 @@
-"""wick 数据层：三张表 + 去重 + 状态流转。
+"""wick data layer: three tables, dedupe, and state transitions.
 
-设计要点（对应 DECISIONS.md 决策 6）：
-- 三张表状态机各自独立，不塞一张表（否则一堆互斥空字段）
-- 去重靠唯一索引，不靠应用层判断（并发下应用层判断会漏）
-- 事件消费用单条 UPDATE...RETURNING 原子领取，不给两个 worker 抢同一条的机会
+Design notes (see DECISIONS.md #6):
+- Each table owns its own state machine instead of one wide table; a single
+  table would end up full of mutually exclusive nullable columns.
+- Dedupe relies on a UNIQUE index, not an application-level check; a check in
+  the app races under concurrency and misses.
+- Events are claimed with a single UPDATE ... RETURNING so two workers can
+  never grab the same row.
 
-ponytail: 单 worker 假设（上游建议「一个 inbox 一个活跃 worker」）。多 worker
-并行时把 UPDATE 换成 BEGIN IMMEDIATE + 行锁，或给 source_type 分片。
+ponytail: single-worker assumption (upstream advice: one active worker per
+inbox). For real parallelism, either add BEGIN IMMEDIATE plus row locks or
+shard by source_type -- do not just start a second worker.
 """
 from __future__ import annotations
 
@@ -62,7 +66,7 @@ CREATE TABLE IF NOT EXISTS approvals (
 );
 CREATE INDEX IF NOT EXISTS idx_approvals_status ON approvals(status);
 
--- 事件源的水位线等键值元数据（例如 github:cmyyy/wick:last_poll）
+-- Key/value metadata for event sources (e.g. github:cmyyy/wick:last_poll watermark).
 CREATE TABLE IF NOT EXISTS meta (
     key        TEXT PRIMARY KEY,
     value      TEXT NOT NULL,
@@ -76,7 +80,7 @@ def now() -> str:
 
 
 def dedupe_key(source_type: str, source_id: str) -> str:
-    """去重键：同一来源的同一条内容，无论进来几次都是同一个 key。"""
+    """Stable key for one item from one source; identical however often it arrives."""
     return hashlib.sha256(f"{source_type}:{source_id}".encode()).hexdigest()
 
 
@@ -86,19 +90,20 @@ def connect(db_path: Path | str = DEFAULT_DB) -> sqlite3.Connection:
         path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(path), timeout=30)
     conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")  # 单写多读，WAL 让读不阻塞写
+    conn.execute("PRAGMA journal_mode=WAL")  # single writer, many readers: WAL keeps reads unblocked
     conn.execute("PRAGMA foreign_keys=ON")
     conn.executescript(SCHEMA)
     return conn
 
 
-# ---------------------------------------------------------------- events
+# ------------------------------------------------------------------ events
 
 def enqueue(conn: sqlite3.Connection, source_type: str, source_id: str,
             payload: dict[str, Any] | None = None) -> tuple[int | None, bool]:
-    """投递一条事件。返回 (event_id, 是否新建)。
+    """Enqueue one event. Returns (event_id, created).
 
-    重复投递返回 (已有 id, False)，不抛异常——调用方（轮询器）不该为重复写代码。
+    Duplicates return (existing_id, False) instead of raising: the caller is a
+    poller and should not need retry logic just because it saw an item twice.
     """
     key = dedupe_key(source_type, source_id)
     ts = now()
@@ -115,7 +120,7 @@ def enqueue(conn: sqlite3.Connection, source_type: str, source_id: str,
 
 
 def claim_next(conn: sqlite3.Connection) -> sqlite3.Row | None:
-    """原子领取一条待处理事件并置为 running。没有则返回 None。"""
+    """Atomically claim one pending event and mark it running. None if the queue is empty."""
     row = conn.execute(
         "UPDATE events SET status='running', attempts=attempts+1, updated_at=? "
         "WHERE id = (SELECT id FROM events WHERE status='pending' ORDER BY id LIMIT 1) "
@@ -138,7 +143,7 @@ def finish_event(conn: sqlite3.Connection, event_id: int, status: str,
 
 
 def requeue_stale(conn: sqlite3.Connection) -> int:
-    """把 running 状态残留的事件放回队列（worker 崩溃后重启时调用）。"""
+    """Return rows stuck in running back to pending (called on worker startup)."""
     cur = conn.execute(
         "UPDATE events SET status='pending', updated_at=? WHERE status='running'", (now(),)
     )
@@ -146,7 +151,7 @@ def requeue_stale(conn: sqlite3.Connection) -> int:
     return cur.rowcount
 
 
-# ------------------------------------------------------------ deliveries
+# -------------------------------------------------------------- deliveries
 
 def add_delivery(conn: sqlite3.Connection, event_id: int | None, body: str,
                  channel: str = "feishu") -> int:
@@ -158,7 +163,7 @@ def add_delivery(conn: sqlite3.Connection, event_id: int | None, body: str,
     return int(cur.lastrowid)
 
 
-# ------------------------------------------------------------- approvals
+# --------------------------------------------------------------- approvals
 
 def request_approval(conn: sqlite3.Connection, event_id: int | None, action: str,
                      detail: dict[str, Any] | None = None) -> int:
@@ -181,7 +186,7 @@ def decide_approval(conn: sqlite3.Connection, approval_id: int, approved: bool) 
         raise ValueError(f"审批 {approval_id} 不在 waiting 状态，无法决策")
 
 
-# ------------------------------------------------------- meta (水位等)
+# ----------------------------------------------------- meta (watermarks)
 
 def get_meta(conn: sqlite3.Connection, key: str) -> str | None:
     row = conn.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
@@ -197,43 +202,43 @@ def set_meta(conn: sqlite3.Connection, key: str, value: str) -> None:
     conn.commit()
 
 
-# --------------------------------------------------------------- selftest
+# ---------------------------------------------------------------- selftest
 
 def _selftest() -> int:
-    """自检：去重、原子领取、状态流转、投递落库。"""
+    """Self-check: dedupe, atomic claim, state transitions, delivery persistence."""
     conn = connect(":memory:")
 
-    # 去重：同一条插两次，只有一条
+    # Dedupe: same item twice yields one row.
     eid1, created1 = enqueue(conn, "github_issue", "cmyyy/wick#1", {"title": "断点续跑失败"})
     eid2, created2 = enqueue(conn, "github_issue", "cmyyy/wick#1", {"title": "断点续跑失败"})
     assert created1 is True and created2 is False, (created1, created2)
     assert eid1 == eid2, (eid1, eid2)
     assert conn.execute("SELECT COUNT(*) c FROM events").fetchone()["c"] == 1
 
-    # 不同来源同 id 不算重复
+    # Same id from a different source is not a duplicate.
     eid3, created3 = enqueue(conn, "manual", "cmyyy/wick#1")
     assert created3 is True and eid3 != eid1
 
-    # 原子领取
+    # Atomic claim.
     ev = claim_next(conn)
     assert ev is not None and ev["status"] == "running" and ev["attempts"] == 1
-    ev2 = claim_next(conn)  # 还有第二条（manual）
+    ev2 = claim_next(conn)  # the manual row is still pending
     assert ev2 is not None and ev2["id"] != ev["id"]
-    assert claim_next(conn) is None  # 都领完了
+    assert claim_next(conn) is None  # everything claimed
 
-    # 状态流转 + 投递
+    # State transition plus delivery.
     finish_event(conn, ev["id"], "done")
     add_delivery(conn, ev["id"], "已处理：断点续跑失败")
     row = conn.execute("SELECT status FROM events WHERE id=?", (ev["id"],)).fetchone()
     assert row["status"] == "done"
     assert conn.execute("SELECT COUNT(*) c FROM deliveries").fetchone()["c"] == 1
 
-    # 崩溃恢复：running 的能被放回队列
+    # Crash recovery: rows left running go back to pending.
     n = requeue_stale(conn)
-    assert n == 1, n  # 只有 ev2 还在 running
+    assert n == 1, n  # only ev2 is still running
     assert claim_next(conn)["id"] == ev2["id"]
 
-    # 审批状态机
+    # Approval state machine.
     aid = request_approval(conn, ev["id"], "提 PR", {"repo": "cmyyy/wick"})
     decide_approval(conn, aid, True)
     assert conn.execute("SELECT status FROM approvals WHERE id=?", (aid,)).fetchone()["status"] == "approved"

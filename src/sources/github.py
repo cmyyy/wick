@@ -1,11 +1,15 @@
-"""GitHub issue 事件源：since 增量轮询。
+"""GitHub issue event source: incremental polling via `since`.
 
-设计要点：
-- 只用 stdlib（urllib），不为几十行 HTTP 引一个依赖
-- token 优先复用 gh CLI 的认证（`gh auth token`），其次读环境变量 GITHUB_TOKEN
-- 水位线存 DB meta 表，用「本次 poll 的开始时刻」而不是「最后一条 issue 的 updated_at」：
-  后者在有并发更新/分页交错时会漏事件，前者最坏只是多拉一次（去重会挡掉）
-- PR 也会从 issues API 返回，必须按 `pull_request` 字段排除，否则会把 PR 当 issue 处理
+Design notes:
+- stdlib only (urllib); a few dozen lines of HTTP do not justify a dependency.
+- The token is reused from the gh CLI (`gh auth token`) before falling back to
+  GITHUB_TOKEN, so the project never keeps a second copy of a credential.
+- The watermark lives in the DB meta table and records the START of the poll,
+  not the last issue's updated_at. The latter can silently skip items updated
+  while a paged fetch is in flight; using the start time costs at most one
+  redundant fetch, which dedupe absorbs.
+- The issues endpoint also returns pull requests. They must be filtered by the
+  `pull_request` key or they get processed as issues.
 """
 from __future__ import annotations
 
@@ -28,7 +32,7 @@ GH_CANDIDATES = [
     str(Path.home() / "AppData" / "Local" / "gh-cli" / "bin" / "gh.exe"),
     "gh",
 ]
-BODY_LIMIT = 4000  # issue 正文可能很长，只留前面这段给 prompt
+BODY_LIMIT = 4000  # issue bodies can be long; only the head is useful inside a prompt
 
 
 def _now() -> datetime:
@@ -40,7 +44,7 @@ def _iso(dt: datetime) -> str:
 
 
 def resolve_token() -> str | None:
-    """优先用 gh CLI 的 token（不落盘、不打印），其次环境变量。"""
+    """Prefer the gh CLI token (nothing on disk here), then env vars."""
     for env in ("WICK_GITHUB_TOKEN", "GITHUB_TOKEN"):
         v = os.environ.get(env)
         if v:
@@ -81,7 +85,7 @@ def _api_get(path: str, token: str | None, params: dict | None = None) -> tuple[
 
 def fetch_issues(repo: str, since: str | None = None, token: str | None = None,
                  per_page: int = 100, max_pages: int = 10) -> list[dict]:
-    """拉取 issue（排除 PR），按 updated_at 升序。"""
+    """Fetch issues (PRs included by the API, filtered by the caller), oldest update first."""
     out: list[dict] = []
     params = {
         "state": "all",
@@ -104,7 +108,7 @@ def fetch_issues(repo: str, since: str | None = None, token: str | None = None,
 
 
 def summarize(issue: dict, repo: str) -> dict:
-    """把 GitHub 的 issue 压成 worker 需要的最小 payload。"""
+    """Shrink a GitHub issue to the minimal payload the worker needs."""
     body = issue.get("body") or ""
     if len(body) > BODY_LIMIT:
         body = body[:BODY_LIMIT] + "\n\n…（正文过长已截断）"
@@ -122,11 +126,11 @@ def summarize(issue: dict, repo: str) -> dict:
 
 def poll(conn, repo: str, fetch=None, token: str | None = None,
          lookback_days: int = 7) -> dict:
-    """增量轮询一次，把新 issue 写进 events。返回统计。
+    """Run one incremental poll and enqueue new issues. Returns stats.
 
-    fetch 可注入，便于自检时不打网络。
+    `fetch` is injectable so the self-check never hits the network.
     """
-    started = _now()  # 水位用开始时刻：最坏多拉一次，绝不漏
+    started = _now()  # watermark = poll start: worst case one redundant fetch, never a gap
     meta_key = f"github:{repo}:last_poll"
     since = db.get_meta(conn, meta_key)
     if not since:
@@ -140,7 +144,7 @@ def poll(conn, repo: str, fetch=None, token: str | None = None,
     stats = {"fetched": len(raw), "skipped_pr": 0, "created": 0, "duplicate": 0}
 
     for issue in raw:
-        if "pull_request" in issue:  # PR 不是 issue 事件
+        if "pull_request" in issue:  # a PR is not an issue event
             stats["skipped_pr"] += 1
             continue
         _eid, created = db.enqueue(
@@ -154,10 +158,10 @@ def poll(conn, repo: str, fetch=None, token: str | None = None,
     return stats
 
 
-# --------------------------------------------------------------- selftest
+# ---------------------------------------------------------------- selftest
 
 def _selftest() -> int:
-    """自检：PR 过滤、去重、水位推进、正文截断。不打网络。"""
+    """Self-check: PR filtering, dedupe, watermark advance, body truncation. No network."""
     conn = db.connect(":memory:")
     repo = "cmyyy/wick"
 
@@ -174,11 +178,10 @@ def _selftest() -> int:
 
     s1 = poll(conn, repo, fetch=fake_fetch)
     assert s1["fetched"] == 3, s1
-    assert s1["skipped_pr"] == 1, s1          # PR 被排除
-    assert s1["created"] == 2, s1             # 只进 2 条
+    assert s1["skipped_pr"] == 1, s1           # the PR is dropped
+    assert s1["created"] == 2, s1              # only two become events
     assert s1["duplicate"] == 0, s1
 
-    # payload 正确
     row = conn.execute("SELECT payload FROM events WHERE source_id=?",
                        (f"{repo}#1",)).fetchone()
     p = json.loads(row["payload"])
@@ -187,12 +190,12 @@ def _selftest() -> int:
                             (f"{repo}#3",)).fetchone()
     assert "已截断" in json.loads(long_row["payload"])["body"]
 
-    # 第二次 poll：同批数据不产生新事件
+    # A second poll over the same batch creates nothing new.
     s2 = poll(conn, repo, fetch=fake_fetch)
     assert s2["created"] == 0 and s2["duplicate"] == 2, s2
     assert conn.execute("SELECT COUNT(*) c FROM events").fetchone()["c"] == 2
 
-    # 水位推进了，且第二次传入的 since 是第一次的开始时刻
+    # The watermark advanced and is passed back into the next fetch.
     assert db.get_meta(conn, f"github:{repo}:last_poll") is not None
     captured = {}
 
