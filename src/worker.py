@@ -5,9 +5,9 @@ concurrent runs would touch the same files. Real parallelism means sharding by
 source_type, not adding threads here.
 
 Usage:
-    python worker.py --once        # drain the current queue, then exit
-    python worker.py               # stay resident, poll every 5s
-    python worker.py --selftest    # self-check
+    python worker.py --once                        # drain the queue, then exit
+    python worker.py --repo cmyyy/wick             # resident: poll GitHub + consume
+    python worker.py --selftest                    # self-check
 """
 from __future__ import annotations
 
@@ -24,18 +24,23 @@ import db  # noqa: E402
 
 log = logging.getLogger("wick.worker")
 
-POLL_INTERVAL = 5  # seconds
+POLL_INTERVAL = 5        # seconds between queue checks
+GITHUB_INTERVAL = 300    # seconds between GitHub polls
 
 
 def handle(event) -> str:
     """Process one event and return the text to deliver.
 
-    D1: placeholder that only echoes, used to prove the in -> process -> out path.
-    D3: replaced by a real agent run via the Hermes CLI or gateway RPC.
+    A github_issue becomes a real Hermes run (D3). Other source types still take
+    the placeholder path until they have a prompt of their own.
     """
+    if event["source_type"] == "github_issue":
+        import agent  # local import: keeps --selftest free of model deps
+        return agent.handle_event(event)
+
     payload = json.loads(event["payload"] or "{}")
     title = payload.get("title") or payload.get("text") or "(无标题)"
-    return f"[D1 占位] 处理了 {event['source_type']}:{event['source_id']} — {title}"
+    return f"[占位] 处理了 {event['source_type']}:{event['source_id']} — {title}"
 
 
 def run_once(conn) -> int:
@@ -58,7 +63,16 @@ def run_once(conn) -> int:
         log.info("done #%s %s:%s", ev["id"], ev["source_type"], ev["source_id"])
 
 
-def serve(conn, interval: int = POLL_INTERVAL) -> None:
+def poll_github(conn, repo: str) -> dict:
+    """One GitHub poll, isolated so a network failure cannot kill the worker."""
+    from sources import github
+    stats = github.poll(conn, repo)
+    log.info("poll %s: %s", repo, stats)
+    return stats
+
+
+def serve(conn, interval: int = POLL_INTERVAL, repo: str | None = None,
+          github_interval: int = GITHUB_INTERVAL) -> None:
     """Resident loop. Exits cleanly on SIGTERM/SIGINT."""
     stopping = {"flag": False}
 
@@ -73,10 +87,17 @@ def serve(conn, interval: int = POLL_INTERVAL) -> None:
     if n:
         log.warning("恢复了 %s 条残留的 running 事件", n)
 
-    log.info("worker 启动，轮询间隔 %ss，库=%s", interval, db.DEFAULT_DB)
+    log.info("worker 启动，轮询间隔 %ss，库=%s，仓库=%s", interval, db.DEFAULT_DB, repo or "(不轮询)")
+    next_poll = 0.0
     while not stopping["flag"]:
-        processed = run_once(conn)
-        if processed == 0:
+        if repo and time.time() >= next_poll:
+            try:
+                poll_github(conn, repo)
+            except Exception:  # a flaky network must not stop event consumption
+                log.exception("GitHub 轮询失败，%ss 后重试", github_interval)
+            next_poll = time.time() + github_interval
+
+        if run_once(conn) == 0:
             time.sleep(interval)
     log.info("worker 退出")
 
@@ -84,49 +105,53 @@ def serve(conn, interval: int = POLL_INTERVAL) -> None:
 # ---------------------------------------------------------------- selftest
 
 def _selftest() -> int:
-    """Self-check: full in -> process -> out path, plus dedupe and failure isolation."""
-    conn = db.connect(":memory:")
+    """Self-check: full in -> process -> out path, plus dedupe and failure isolation.
 
-    # Two real events plus one duplicate.
-    db.enqueue(conn, "github_issue", "cmyyy/wick#1", {"title": "断点续跑失败"})
-    db.enqueue(conn, "github_issue", "cmyyy/wick#2", {"title": "outbox 节流算错"})
-    db.enqueue(conn, "github_issue", "cmyyy/wick#1", {"title": "断点续跑失败"})  # duplicate
-
-    n = run_once(conn)
-    assert n == 2, n  # the duplicate never reaches handle()
-
-    rows = conn.execute("SELECT status, COUNT(*) c FROM events GROUP BY status").fetchall()
-    assert {r["status"]: r["c"] for r in rows} == {"done": 2}, rows
-
-    deliveries = conn.execute("SELECT body FROM deliveries ORDER BY id").fetchall()
-    assert len(deliveries) == 2, deliveries
-    assert "断点续跑失败" in deliveries[0]["body"], deliveries[0]["body"]
-
-    # An empty queue does nothing.
-    assert run_once(conn) == 0
-
-    # Failure isolation: a raising handle() marks the event failed, still emits a
-    # delivery, and leaves the worker running.
+    handle() is stubbed for the whole test: the real one would call Hermes.
+    """
     global handle
     original = handle
-
-    def boom(_event):
-        raise RuntimeError("模拟处理失败")
-
-    handle = boom
+    handle = lambda ev: f"[test] 处理了 {ev['source_id']}"
     try:
+        conn = db.connect(":memory:")
+
+        # Two real events plus one duplicate.
+        db.enqueue(conn, "github_issue", "cmyyy/wick#1", {"title": "断点续跑失败"})
+        db.enqueue(conn, "github_issue", "cmyyy/wick#2", {"title": "outbox 节流算错"})
+        db.enqueue(conn, "github_issue", "cmyyy/wick#1", {"title": "断点续跑失败"})  # duplicate
+
+        n = run_once(conn)
+        assert n == 2, n  # the duplicate never reaches handle()
+
+        rows = conn.execute("SELECT status, COUNT(*) c FROM events GROUP BY status").fetchall()
+        assert {r["status"]: r["c"] for r in rows} == {"done": 2}, rows
+
+        deliveries = conn.execute("SELECT body FROM deliveries ORDER BY id").fetchall()
+        assert len(deliveries) == 2, deliveries
+        assert "cmyyy/wick#1" in deliveries[0]["body"], deliveries[0]["body"]
+
+        # An empty queue does nothing.
+        assert run_once(conn) == 0
+
+        # Failure isolation: a raising handle() marks the event failed, still emits a
+        # delivery, and leaves the worker running.
+        def boom(_event):
+            raise RuntimeError("模拟处理失败")
+
+        handle = boom
         db.enqueue(conn, "manual", "fail-1", {"title": "会失败的那条"})
         assert run_once(conn) == 0  # failures do not count as processed
+
+        failed = conn.execute("SELECT status, error FROM events WHERE source_id='fail-1'").fetchone()
+        assert failed["status"] == "failed" and "模拟处理失败" in failed["error"], dict(failed)
+        assert conn.execute(
+            "SELECT COUNT(*) c FROM deliveries WHERE body LIKE '处理失败%'"
+        ).fetchone()["c"] == 1
+
+        conn.close()
     finally:
         handle = original
 
-    failed = conn.execute("SELECT status, error FROM events WHERE source_id='fail-1'").fetchone()
-    assert failed["status"] == "failed" and "模拟处理失败" in failed["error"], dict(failed)
-    assert conn.execute(
-        "SELECT COUNT(*) c FROM deliveries WHERE body LIKE '处理失败%'"
-    ).fetchone()["c"] == 1
-
-    conn.close()
     print("worker.py selftest OK: 进→处理→出 / 去重 / 空队列 / 失败隔离")
     return 0
 
@@ -134,7 +159,10 @@ def _selftest() -> int:
 def main() -> int:
     ap = argparse.ArgumentParser(description="wick worker")
     ap.add_argument("--once", action="store_true", help="处理完当前队列就退出")
-    ap.add_argument("--interval", type=int, default=POLL_INTERVAL, help="轮询间隔（秒）")
+    ap.add_argument("--interval", type=int, default=POLL_INTERVAL, help="队列轮询间隔（秒）")
+    ap.add_argument("--repo", default=None, help="要轮询的 GitHub 仓库（owner/name）")
+    ap.add_argument("--github-interval", type=int, default=GITHUB_INTERVAL,
+                    help="GitHub 轮询间隔（秒）")
     ap.add_argument("--db", default=None, help="数据库路径（默认 WICK_DB 或 ~/.wick/wick.db）")
     ap.add_argument("--selftest", action="store_true")
     ap.add_argument("-v", "--verbose", action="store_true")
@@ -152,10 +180,12 @@ def main() -> int:
     conn = db.connect(args.db or db.DEFAULT_DB)
     try:
         if args.once:
+            if args.repo:
+                poll_github(conn, args.repo)  # --once also refreshes the source
             n = run_once(conn)
             print(f"处理了 {n} 条事件")
             return 0
-        serve(conn, args.interval)
+        serve(conn, args.interval, args.repo, args.github_interval)
         return 0
     finally:
         conn.close()
