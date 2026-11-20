@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import signal
 import sys
 import time
@@ -26,17 +27,22 @@ log = logging.getLogger("wick.worker")
 
 POLL_INTERVAL = 5        # seconds between queue checks
 GITHUB_INTERVAL = 300    # seconds between GitHub polls
+FIX_MODE = os.environ.get("WICK_MODE", "fix")  # "fix" edits code, "analyze" only reports
 
 
 def handle(event) -> str:
     """Process one event and return the text to deliver.
 
-    A github_issue becomes a real Hermes run (D3). Other source types still take
-    the placeholder path until they have a prompt of their own.
+    A github_issue becomes a real Hermes run. WICK_MODE picks between the two
+    modes: "fix" (D4) edits inside a worktree and verifies, "analyze" (D3) only
+    reports a plan. Other source types take the placeholder path until they have
+    a prompt of their own.
     """
     if event["source_type"] == "github_issue":
         import agent  # local import: keeps --selftest free of model deps
-        return agent.handle_event(event)
+        if FIX_MODE == "analyze":
+            return agent.handle_event(event)
+        return agent.handle_issue_fix(event)
 
     payload = json.loads(event["payload"] or "{}")
     title = payload.get("title") or payload.get("text") or "(无标题)"
@@ -55,7 +61,9 @@ def run_once(conn) -> int:
         except Exception as exc:  # one bad event must not take the worker down
             log.exception("事件 %s 处理失败", ev["id"])
             db.finish_event(conn, ev["id"], "failed", repr(exc))
-            db.add_delivery(conn, ev["id"], f"处理失败：{ev['source_type']}:{ev['source_id']} — {exc!r}")
+            # str(exc), not repr: a failed D4 run carries the whole review report.
+            db.add_delivery(conn, ev["id"],
+                            f"处理失败：{ev['source_type']}:{ev['source_id']}\n\n{exc}")
             continue
         db.finish_event(conn, ev["id"], "done")
         db.add_delivery(conn, ev["id"], text)
