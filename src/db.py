@@ -55,13 +55,14 @@ CREATE TABLE IF NOT EXISTS deliveries (
 CREATE INDEX IF NOT EXISTS idx_deliveries_status ON deliveries(status);
 
 CREATE TABLE IF NOT EXISTS approvals (
-    id         INTEGER PRIMARY KEY AUTOINCREMENT,
-    event_id   INTEGER REFERENCES events(id),
-    action     TEXT NOT NULL,
-    detail     TEXT NOT NULL DEFAULT '{}',
-    status     TEXT NOT NULL DEFAULT 'waiting',
-    created_at TEXT NOT NULL,
-    decided_at TEXT,
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_id    INTEGER REFERENCES events(id),
+    action      TEXT NOT NULL,
+    detail      TEXT NOT NULL DEFAULT '{}',
+    status      TEXT NOT NULL DEFAULT 'waiting',
+    created_at  TEXT NOT NULL,
+    decided_at  TEXT,
+    executed_at TEXT,
     CHECK (status IN ('waiting','approved','rejected','expired'))
 );
 CREATE INDEX IF NOT EXISTS idx_approvals_status ON approvals(status);
@@ -93,7 +94,16 @@ def connect(db_path: Path | str = DEFAULT_DB) -> sqlite3.Connection:
     conn.execute("PRAGMA journal_mode=WAL")  # single writer, many readers: WAL keeps reads unblocked
     conn.execute("PRAGMA foreign_keys=ON")
     conn.executescript(SCHEMA)
+    _migrate(conn)
     return conn
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """Add columns that postdate the first deployment; CREATE TABLE IF NOT EXISTS will not."""
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(approvals)")}
+    if "executed_at" not in cols:
+        conn.execute("ALTER TABLE approvals ADD COLUMN executed_at TEXT")
+        conn.commit()
 
 
 # ------------------------------------------------------------------ events
@@ -184,6 +194,26 @@ def decide_approval(conn: sqlite3.Connection, approval_id: int, approved: bool) 
     conn.commit()
     if cur.rowcount == 0:
         raise ValueError(f"审批 {approval_id} 不在 waiting 状态，无法决策")
+
+
+def approved_undone(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    """Approvals the user said yes to that have not been carried out yet."""
+    return conn.execute(
+        "SELECT * FROM approvals WHERE status='approved' AND executed_at IS NULL ORDER BY id"
+    ).fetchall()
+
+
+def mark_executed(conn: sqlite3.Connection, approval_id: int, error: str | None = None) -> None:
+    """Record that an approved action ran, or failed trying. Either way it is not retried blindly."""
+    if error:
+        row = conn.execute("SELECT detail FROM approvals WHERE id=?", (approval_id,)).fetchone()
+        detail = json.loads(row["detail"] or "{}")
+        detail["execution_error"] = error
+        conn.execute("UPDATE approvals SET executed_at=?, detail=? WHERE id=?",
+                     (now(), json.dumps(detail, ensure_ascii=False), approval_id))
+    else:
+        conn.execute("UPDATE approvals SET executed_at=? WHERE id=?", (now(), approval_id))
+    conn.commit()
 
 
 # ----------------------------------------------------- meta (watermarks)

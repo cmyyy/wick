@@ -30,23 +30,53 @@ GITHUB_INTERVAL = 300    # seconds between GitHub polls
 FIX_MODE = os.environ.get("WICK_MODE", "fix")  # "fix" edits code, "analyze" only reports
 
 
-def handle(event) -> str:
+def handle(conn, event) -> str:
     """Process one event and return the text to deliver.
 
     A github_issue becomes a real Hermes run. WICK_MODE picks between the two
-    modes: "fix" (D4) edits inside a worktree and verifies, "analyze" (D3) only
-    reports a plan. Other source types take the placeholder path until they have
-    a prompt of their own.
+    modes: "fix" (D4/D5) edits inside a worktree, verifies, then asks for
+    approval; "analyze" (D3) only reports a plan. Other source types take the
+    placeholder path until they have a prompt of their own.
     """
     if event["source_type"] == "github_issue":
         import agent  # local import: keeps --selftest free of model deps
         if FIX_MODE == "analyze":
             return agent.handle_event(event)
-        return agent.handle_issue_fix(event)
+        return agent.handle_issue_fix(conn, event)
 
     payload = json.loads(event["payload"] or "{}")
     title = payload.get("title") or payload.get("text") or "(无标题)"
     return f"[占位] 处理了 {event['source_type']}:{event['source_id']} — {title}"
+
+
+def process_approvals(conn) -> int:
+    """Carry out approvals the user has granted. Returns how many ran.
+
+    This is the only path that performs irreversible work, and it only ever
+    looks at rows a human marked approved.
+    """
+    import actions
+
+    ran = 0
+    for row in db.approved_undone(conn):
+        detail = json.loads(row["detail"] or "{}")
+        detail.setdefault("action", row["action"])
+        worktree = Path(detail.get("worktree") or "")
+        try:
+            result = actions.execute_approval(detail, worktree)
+        except Exception as exc:
+            db.mark_executed(conn, row["id"], error=str(exc))
+            db.add_delivery(conn, row["event_id"],
+                            f"批准的动作执行失败（审批 #{row['id']}）：{exc}")
+            log.exception("审批 %s 执行失败", row["id"])
+            continue
+        db.mark_executed(conn, row["id"])
+        db.add_delivery(conn, row["event_id"],
+                        f"已{dict(row)['action']}：{result['url']}\n"
+                        f"commit {result['commit']}（审批 #{row['id']} 已执行）")
+        log.info("审批 %s 已执行: %s", row["id"], result["url"])
+        ran += 1
+    return ran
 
 
 def run_once(conn) -> int:
@@ -57,7 +87,7 @@ def run_once(conn) -> int:
         if ev is None:
             return processed
         try:
-            text = handle(ev)
+            text = handle(conn, ev)
         except Exception as exc:  # one bad event must not take the worker down
             log.exception("事件 %s 处理失败", ev["id"])
             db.finish_event(conn, ev["id"], "failed", repr(exc))
@@ -105,6 +135,8 @@ def serve(conn, interval: int = POLL_INTERVAL, repo: str | None = None,
                 log.exception("GitHub 轮询失败，%ss 后重试", github_interval)
             next_poll = time.time() + github_interval
 
+        if process_approvals(conn):
+            continue  # an approved action just produced deliveries; drain the queue too
         if run_once(conn) == 0:
             time.sleep(interval)
     log.info("worker 退出")
@@ -119,7 +151,7 @@ def _selftest() -> int:
     """
     global handle
     original = handle
-    handle = lambda ev: f"[test] 处理了 {ev['source_id']}"
+    handle = lambda conn, ev: f"[test] 处理了 {ev['source_id']}"
     try:
         conn = db.connect(":memory:")
 
@@ -143,7 +175,7 @@ def _selftest() -> int:
 
         # Failure isolation: a raising handle() marks the event failed, still emits a
         # delivery, and leaves the worker running.
-        def boom(_event):
+        def boom(_conn, _event):
             raise RuntimeError("模拟处理失败")
 
         handle = boom
@@ -190,6 +222,9 @@ def main() -> int:
         if args.once:
             if args.repo:
                 poll_github(conn, args.repo)  # --once also refreshes the source
+            ran = process_approvals(conn)
+            if ran:
+                print(f"执行了 {ran} 个已批准的动作")
             n = run_once(conn)
             print(f"处理了 {n} 条事件")
             return 0

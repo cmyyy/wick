@@ -37,6 +37,8 @@ CHECKS = [
 
 VERDICTS_FIX = ("已修复", "部分修复", "无法修复")
 VERDICTS_ANALYZE = ("可处理", "需补充信息", "不处理")
+# The only irreversible action this version asks permission for.
+_ACTION_LABEL = "提 PR"
 
 
 def _render(template: str, payload: dict, **extra) -> str:
@@ -138,7 +140,8 @@ def _checks_line(checks: dict) -> str:
 
 
 def compose_fix_report(payload: dict, text: str, run_error: Exception | None,
-                       checks: dict, changes: dict, worktree: Path, branch: str) -> str:
+                       checks: dict, changes: dict, worktree: Path, branch: str,
+                       approval_id: int | None = None) -> str:
     verdict = verdict_of(text, "fix") if text else None
     head = [
         f"针对 {payload.get('repo','?')}#{payload.get('number','?')} {payload.get('title','')}",
@@ -148,6 +151,8 @@ def compose_fix_report(payload: dict, text: str, run_error: Exception | None,
         f"改动：{changes['file_count']} 个文件 +{changes['lines_added']}/-{changes['lines_removed']}",
         f"自检：{_checks_line(checks)}",
     ]
+    if approval_id is not None:
+        head.append(f"待批准：审批 #{approval_id}（{_ACTION_LABEL}）— 什么都没提交，等你点头")
     if changes["file_count"]:
         head.append("改动文件：")
         head += [f"- {f}" for f in changes["files"][:12]]
@@ -156,7 +161,12 @@ def compose_fix_report(payload: dict, text: str, run_error: Exception | None,
         body += [f"**agent 运行失败**：{run_error}", ""]
     if text:
         body += ["—— agent 说明 ——", text]
-    body += ["", f"审查后用 `python src/sandbox.py --prune` 清理 worktree"]
+    body.append("")
+    if approval_id is not None:
+        body += [f"批准: python src/cli.py approve {approval_id}",
+                 f"拒绝: python src/cli.py reject {approval_id}"]
+    else:
+        body.append("审查后用 `python src/sandbox.py --prune` 清理 worktree")
     return "\n".join(head + body)
 
 
@@ -166,12 +176,17 @@ def handle_event(event) -> str:
     return run_prompt(render_issue_prompt(payload))
 
 
-def handle_issue_fix(event) -> str:
-    """D4 path: edit inside a worktree, verify locally, return a reviewable report.
+def handle_issue_fix(conn, event) -> str:
+    """D4/D5 path: edit inside a worktree, verify locally, then ask for approval.
 
-    Raises when the run failed or the self-checks did not all pass: a run that
-    breaks the suite is a failed run, even if the agent claims otherwise.
+    A green suite is evidence, not permission: this never commits, pushes or opens
+    a PR. On success it writes a `waiting` approval row and returns a report
+    telling the user how to approve it.
+
+    Raises when the run failed or the self-checks did not all pass, so a broken
+    run is recorded as failed even if the agent claims otherwise.
     """
+    import db as dbmod
     import sandbox
 
     payload = json.loads(event["payload"] or "{}")
@@ -188,13 +203,28 @@ def handle_issue_fix(event) -> str:
 
     checks = run_checks(worktree)
     changes = sandbox.diff(PROJECT_ROOT, worktree)
-    report = compose_fix_report(payload, text, run_error, checks, changes, worktree, branch)
 
     if run_error is not None:
-        raise RuntimeError(report) from run_error
+        raise RuntimeError(
+            compose_fix_report(payload, text, run_error, checks, changes, worktree, branch)
+        ) from run_error
     if not checks["all_ok"]:
-        raise RuntimeError(report)
-    return report
+        raise RuntimeError(
+            compose_fix_report(payload, text, None, checks, changes, worktree, branch)
+        )
+
+    approval_id = dbmod.request_approval(conn, event["id"], _ACTION_LABEL, {
+        "repo": payload.get("repo"),
+        "number": number,
+        "branch": branch,
+        "base": "main",
+        "title": payload.get("title"),
+        "worktree": str(worktree),
+        "files": changes["files"],
+        "diff": f"+{changes['lines_added']}/-{changes['lines_removed']}",
+    })
+    return compose_fix_report(payload, text, None, checks, changes, worktree, branch,
+                              approval_id=approval_id)
 
 
 # ---------------------------------------------------------------- selftest
