@@ -61,6 +61,13 @@ CREATE TABLE IF NOT EXISTS approvals (
     CHECK (status IN ('waiting','approved','rejected','expired'))
 );
 CREATE INDEX IF NOT EXISTS idx_approvals_status ON approvals(status);
+
+-- 事件源的水位线等键值元数据（例如 github:cmyyy/wick:last_poll）
+CREATE TABLE IF NOT EXISTS meta (
+    key        TEXT PRIMARY KEY,
+    value      TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
 """
 
 
@@ -172,6 +179,22 @@ def decide_approval(conn: sqlite3.Connection, approval_id: int, approved: bool) 
     conn.commit()
     if cur.rowcount == 0:
         raise ValueError(f"审批 {approval_id} 不在 waiting 状态，无法决策")
+
+
+# ------------------------------------------------------- meta (水位等)
+
+def get_meta(conn: sqlite3.Connection, key: str) -> str | None:
+    row = conn.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
+    return row["value"] if row else None
+
+
+def set_meta(conn: sqlite3.Connection, key: str, value: str) -> None:
+    conn.execute(
+        "INSERT INTO meta (key, value, updated_at) VALUES (?,?,?) "
+        "ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
+        (key, value, now()),
+    )
+    conn.commit()
 
 
 # --------------------------------------------------------------- selftest
