@@ -21,6 +21,7 @@
 | 9 | **UI** | Hermes 桌面插件面板，能批准 / 拒绝 |
 | 10 | **评测** | 三条硬指标（闭环成功率 / 重复处理率 / 投递误报率） |
 | 11 | **工期** | 10 个工作日 |
+| 12 | **开发流程** | 所有改动走 issue → branch → PR；agent 可开 PR，不可 merge |
 
 ---
 
@@ -93,6 +94,21 @@ Hermes 上游 issue 放到二期——处理大仓库要先满足它的 AGENTS.m
 早期的四层 grader（硬门槛 + 质量 rubric + 轨迹指标 + 描述一致性）来自 Code Agent 框架设计，对 MVP 太重。
 
 **前 20 条人工标注**撑不起一个总分制，但能撑起"3/20 误报"这种可核实的事实——符合项目红线"引用数字必可核实原文"。rubric 和 judge 校准全部挪到二期。
+
+---
+
+### 12. 为什么所有改动都要走 issue → branch → PR
+
+D1-D5 是直接提交到 `main` 的：没有 issue 当 ticket、没有分支、没有 PR review。这是错的，而且错得很难看——**项目本身在做「危险动作要人批准」，开发流程却一路直达 main**。
+
+从 D6 起强制：
+
+- 每个改动先有 issue（issue 就是 ticket，验收标准写在里面）
+- 每个改动走 `<type>/<issue>-<slug>` 分支
+- PR body 写 `Closes #N`，七个自检全绿
+- **agent 可以开 PR，不可以 merge**——merge 是人的动作，和 approvals 表同一个道理
+
+细节见 `CONTRIBUTING.md`。D1-D5 的历史提交不追溯改写。
 
 ---
 
