@@ -135,7 +135,12 @@ python src/outbox.py           # 自检
 | `WICK_DAILY_LIMIT` | `20` | 每个本地自然日最多发几条，超出的压到次日 0 点 |
 | `WICK_MAX_ATTEMPTS` | `4` | 一条投递尝试几次后判 `failed`（终态） |
 | `WICK_BACKOFF_BASE` | `60` | 指数退避起始秒数：60、120、240…，单次等待上限 1 小时 |
-| `WICK_SEND_CMD` | `hermes send -t {channel}` | 换掉整条发送命令；`{channel}` 由投递行决定，消息正文作为最后一个参数追加 |
+| `WICK_SEND_TARGET` | 无 | **完整**投递目标，如 `feishu:oc_xxx`。投递行的 `channel` 只有平台名时必须设它 |
+| `<PLATFORM>_HOME_CHANNEL` | 无 | 兜底目标，如 `FEISHU_HOME_CHANNEL=oc_xxx`；优先级低于 `WICK_SEND_TARGET` |
+| `WICK_SEND_CMD` | `hermes send -t {channel}` | 换掉整条发送命令。**只有默认命令会替换 `{channel}`**，自定义命令原样切分 |
+| `WICK_DB` | `~/.wick/wick.db` | 数据库路径；`--drain`、worker、`cli.py` 的 `--db` 缺省都读它 |
+
+**默认命令必须能解析出完整 target**。`hermes send -t feishu` 在没配 home channel 时会打印 `No home channel set`、**什么都不发、退出码仍是 0**——所以 `resolve_target()` 会先按「显式 `platform:chat_id` → `WICK_SEND_TARGET` → `<PLATFORM>_HOME_CHANNEL`」补全，都取不到就直接报错并列出这三种修法，不让它变成静默重试。
 
 单次发送超时固定 120 秒（`src/outbox.py` 里的 `SEND_TIMEOUT`，不读环境变量）。
 
