@@ -123,7 +123,7 @@ GitHub 上已经有 5 个同赛道项目（都叫 nightshift），它们解决�
 ```
 wick/
 ├── README.md          项目门面（本文件）
-├── DECISIONS.md       11 条关键决策 + 理由（防止后面改主意）
+├── DECISIONS.md       13 条关键决策 + 理由（防止后面改主意）
 ├── ROADMAP.md         10 个工作日排期
 ├── src/
 │   ├── db.py          三张表 schema + 去重
