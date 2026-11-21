@@ -16,7 +16,10 @@ import json
 import logging
 import os
 import signal
+import socket
+import sqlite3
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -27,7 +30,12 @@ log = logging.getLogger("wick.worker")
 
 POLL_INTERVAL = 5        # seconds between queue checks
 GITHUB_INTERVAL = 300    # seconds between GitHub polls
+HEARTBEAT_INTERVAL = 30  # seconds between lease renewals; must stay well under db.LEASE_SECONDS
 FIX_MODE = os.environ.get("WICK_MODE", "fix")  # "fix" edits code, "analyze" only reports
+
+# Who holds a claimed event. Recorded in events.worker_id so a second worker can
+# tell a live claim from an abandoned one (issue #1).
+WORKER_ID = f"{socket.gethostname()}#{os.getpid()}"
 
 
 def handle(conn, event) -> str:
@@ -79,13 +87,32 @@ def process_approvals(conn) -> int:
     return ran
 
 
+def _renew_lease(conn, event_id: int, stop: threading.Event) -> None:
+    """Keep the claim alive while handle() runs; a real run takes minutes.
+
+    A failed beat is not fatal: the row just ages, and the run's own finish_event
+    still lands. Losing ownership entirely is only possible if the lease expired
+    and another worker reclaimed it -- then the beat is refused and we stop.
+    """
+    try:
+        while not stop.wait(HEARTBEAT_INTERVAL):
+            if not db.heartbeat(conn, event_id, WORKER_ID):
+                log.warning("事件 %s 的租约已不属于本 worker，停止心跳", event_id)
+                return
+    except sqlite3.Error as exc:  # db gone/closed mid-run: let the claim expire normally
+        log.warning("事件 %s 心跳失败：%s", event_id, exc)
+
+
 def run_once(conn) -> int:
     """Drain the queue, returning how many events were processed."""
     processed = 0
     while True:
-        ev = db.claim_next(conn)
+        ev = db.claim_next(conn, WORKER_ID)
         if ev is None:
             return processed
+        stop = threading.Event()
+        beat = threading.Thread(target=_renew_lease, args=(conn, ev["id"], stop), daemon=True)
+        beat.start()
         try:
             text = handle(conn, ev)
         except Exception as exc:  # one bad event must not take the worker down
@@ -95,6 +122,9 @@ def run_once(conn) -> int:
             db.add_delivery(conn, ev["id"],
                             f"处理失败：{ev['source_type']}:{ev['source_id']}\n\n{exc}")
             continue
+        finally:
+            stop.set()   # the lease thread exits at its next wait
+            beat.join()
         db.finish_event(conn, ev["id"], "done")
         db.add_delivery(conn, ev["id"], text)
         processed += 1
@@ -121,11 +151,12 @@ def serve(conn, interval: int = POLL_INTERVAL, repo: str | None = None,
     signal.signal(signal.SIGINT, _stop)
     signal.signal(signal.SIGTERM, _stop)
 
-    n = db.requeue_stale(conn)  # recover rows a previous crash left running
+    n = db.requeue_stale(conn)  # a crashed worker's claim has to age out before it comes back
     if n:
-        log.warning("恢复了 %s 条残留的 running 事件", n)
+        log.warning("回收了 %s 条心跳超时的事件", n)
 
-    log.info("worker 启动，轮询间隔 %ss，库=%s，仓库=%s", interval, db.DEFAULT_DB, repo or "(不轮询)")
+    log.info("worker 启动 worker=%s，轮询间隔 %ss，库=%s，仓库=%s",
+             WORKER_ID, interval, db.DEFAULT_DB, repo or "(不轮询)")
     next_poll = 0.0
     while not stopping["flag"]:
         if repo and time.time() >= next_poll:
@@ -138,6 +169,10 @@ def serve(conn, interval: int = POLL_INTERVAL, repo: str | None = None,
         if process_approvals(conn):
             continue  # an approved action just produced deliveries; drain the queue too
         if run_once(conn) == 0:
+            # Idle is when a dead worker's claim becomes visible: reclaim it and
+            # loop again instead of sleeping on it. Recovery needs no restart.
+            if db.requeue_stale(conn):
+                continue
             time.sleep(interval)
     log.info("worker 退出")
 
@@ -149,8 +184,9 @@ def _selftest() -> int:
 
     handle() is stubbed for the whole test: the real one would call Hermes.
     """
-    global handle
+    global handle, HEARTBEAT_INTERVAL
     original = handle
+    original_beat = HEARTBEAT_INTERVAL
     handle = lambda conn, ev: f"[test] 处理了 {ev['source_id']}"
     try:
         conn = db.connect(":memory:")
@@ -173,6 +209,32 @@ def _selftest() -> int:
         # An empty queue does nothing.
         assert run_once(conn) == 0
 
+        # Lease (issue #1): while handle() is busy, the heartbeat thread renews the
+        # claim, so a second worker starting up mid-run reclaims nothing.
+        seen = {}
+
+        def slow(inner_conn, ev):
+            seen["before"] = inner_conn.execute(
+                "SELECT heartbeat_at FROM events WHERE id=?", (ev["id"],)).fetchone()["heartbeat_at"]
+            seen["owner"] = ev["worker_id"]
+            time.sleep(1.2)  # long enough to cross a whole-second timestamp boundary
+            seen["during"] = inner_conn.execute(
+                "SELECT heartbeat_at FROM events WHERE id=?", (ev["id"],)).fetchone()["heartbeat_at"]
+            seen["requeued"] = db.requeue_stale(inner_conn)  # a second worker's startup call
+            seen["status"] = inner_conn.execute(
+                "SELECT status FROM events WHERE id=?", (ev["id"],)).fetchone()["status"]
+            return f"[test] 处理了 {ev['source_id']}"
+
+        HEARTBEAT_INTERVAL = 0.05
+        handle = slow
+        db.enqueue(conn, "manual", "long-1", {"title": "跑得比较久的那条"})
+        assert run_once(conn) == 1
+        assert seen["owner"] == WORKER_ID, seen
+        assert seen["during"] > seen["before"], seen  # beating, not just the claim timestamp
+        assert seen["requeued"] == 0 and seen["status"] == "running", seen  # not stolen mid-run
+        assert conn.execute(
+            "SELECT status FROM events WHERE source_id='long-1'").fetchone()["status"] == "done"
+
         # Failure isolation: a raising handle() marks the event failed, still emits a
         # delivery, and leaves the worker running.
         def boom(_conn, _event):
@@ -191,8 +253,9 @@ def _selftest() -> int:
         conn.close()
     finally:
         handle = original
+        HEARTBEAT_INTERVAL = original_beat
 
-    print("worker.py selftest OK: 进→处理→出 / 去重 / 空队列 / 失败隔离")
+    print("worker.py selftest OK: 进→处理→出 / 去重 / 空队列 / 租约心跳 / 失败隔离")
     return 0
 
 
