@@ -6,11 +6,14 @@ Design notes (see DECISIONS.md #6):
 - Dedupe relies on a UNIQUE index, not an application-level check; a check in
   the app races under concurrency and misses.
 - Events are claimed with a single UPDATE ... RETURNING so two workers can
-  never grab the same row.
+  never grab the same row, and the claim records who holds it (worker_id) and a
+  lease (heartbeat_at). A claim only dies of old age: requeue_stale() reclaims
+  rows whose worker stopped beating, never rows a live worker is still on.
 
-ponytail: single-worker assumption (upstream advice: one active worker per
-inbox). For real parallelism, either add BEGIN IMMEDIATE plus row locks or
-shard by source_type -- do not just start a second worker.
+ponytail: one worker per inbox on purpose (upstream advice, and two concurrent
+runs would edit the same files). The lease exists so that starting a second
+worker by hand is harmless instead of double-processing; real parallelism means
+sharding by source_type, not more workers on one inbox.
 """
 from __future__ import annotations
 
@@ -18,11 +21,18 @@ import hashlib
 import json
 import os
 import sqlite3
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
 DEFAULT_DB = Path(os.environ.get("WICK_DB") or Path.home() / ".wick" / "wick.db")
+
+# Lease length. A running event stays owned while its worker keeps beating
+# heartbeat_at; a claim whose beat is older than this is presumed dead and gets
+# requeued. Shorter = a killed worker's event retries sooner, but a stalled
+# worker (machine suspended, heartbeat thread starved) is more likely to be
+# presumed dead. Keep the beat well under it: worker.HEARTBEAT_INTERVAL.
+LEASE_SECONDS = 90
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS events (
@@ -32,6 +42,8 @@ CREATE TABLE IF NOT EXISTS events (
     source_id   TEXT NOT NULL,
     payload     TEXT NOT NULL DEFAULT '{}',
     status      TEXT NOT NULL DEFAULT 'pending',
+    worker_id   TEXT,
+    heartbeat_at TEXT,
     attempts    INTEGER NOT NULL DEFAULT 0,
     created_at  TEXT NOT NULL,
     updated_at  TEXT NOT NULL,
@@ -89,7 +101,10 @@ def connect(db_path: Path | str = DEFAULT_DB) -> sqlite3.Connection:
     path = Path(db_path)
     if str(path) != ":memory:":
         path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(str(path), timeout=30)
+    # check_same_thread=False: the worker's heartbeat thread renews the lease on
+    # its in-flight event while the main thread is blocked inside handle().
+    # SQLite is built serialized (its default), so the connection stays safe.
+    conn = sqlite3.connect(str(path), timeout=30, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")  # single writer, many readers: WAL keeps reads unblocked
     conn.execute("PRAGMA foreign_keys=ON")
@@ -103,7 +118,15 @@ def _migrate(conn: sqlite3.Connection) -> None:
     cols = {r["name"] for r in conn.execute("PRAGMA table_info(approvals)")}
     if "executed_at" not in cols:
         conn.execute("ALTER TABLE approvals ADD COLUMN executed_at TEXT")
-        conn.commit()
+
+    # Lease columns (issue #1). Rows claimed before this upgrade have no
+    # heartbeat_at and are treated as stale on the next requeue_stale().
+    ecols = {r["name"] for r in conn.execute("PRAGMA table_info(events)")}
+    for col in ("worker_id", "heartbeat_at"):
+        if col not in ecols:
+            conn.execute(f"ALTER TABLE events ADD COLUMN {col} TEXT")
+
+    conn.commit()
 
 
 # ------------------------------------------------------------------ events
@@ -129,16 +152,37 @@ def enqueue(conn: sqlite3.Connection, source_type: str, source_id: str,
     return (row["id"] if row else None), False
 
 
-def claim_next(conn: sqlite3.Connection) -> sqlite3.Row | None:
-    """Atomically claim one pending event and mark it running. None if the queue is empty."""
+def claim_next(conn: sqlite3.Connection, worker_id: str) -> sqlite3.Row | None:
+    """Atomically claim one pending event and mark it running under this worker.
+
+    Stamps worker_id and the starting heartbeat, which is the lease: other
+    workers may only take it back once this one stops beating. None if the queue
+    is empty.
+    """
+    ts = now()
     row = conn.execute(
-        "UPDATE events SET status='running', attempts=attempts+1, updated_at=? "
+        "UPDATE events SET status='running', worker_id=?, heartbeat_at=?, "
+        "attempts=attempts+1, updated_at=? "
         "WHERE id = (SELECT id FROM events WHERE status='pending' ORDER BY id LIMIT 1) "
         "RETURNING *",
-        (now(),),
+        (worker_id, ts, ts),
     ).fetchone()
     conn.commit()
     return row
+
+
+def heartbeat(conn: sqlite3.Connection, event_id: int, worker_id: str) -> bool:
+    """Renew the lease on one in-flight event. False when it is no longer ours.
+
+    Renewing is deliberately ownership-checked: if this row was reclaimed and
+    re-claimed elsewhere, the old worker must not resurrect its claim.
+    """
+    cur = conn.execute(
+        "UPDATE events SET heartbeat_at=? WHERE id=? AND worker_id=? AND status='running'",
+        (now(), event_id, worker_id),
+    )
+    conn.commit()
+    return cur.rowcount == 1
 
 
 def finish_event(conn: sqlite3.Connection, event_id: int, status: str,
@@ -153,9 +197,19 @@ def finish_event(conn: sqlite3.Connection, event_id: int, status: str,
 
 
 def requeue_stale(conn: sqlite3.Connection) -> int:
-    """Return rows stuck in running back to pending (called on worker startup)."""
+    """Reclaim events whose worker stopped beating (kill -9, crash, power loss).
+
+    Only a stale lease is reclaimed, never "everything still running": a live
+    worker renews heartbeat_at every few seconds, so starting a second worker by
+    hand cannot steal the event the first one is in the middle of processing.
+    Recovery latency after a crash is at most LEASE_SECONDS.
+    """
+    cutoff = (datetime.now(timezone.utc)
+              - timedelta(seconds=LEASE_SECONDS)).isoformat(timespec="seconds")
     cur = conn.execute(
-        "UPDATE events SET status='pending', updated_at=? WHERE status='running'", (now(),)
+        "UPDATE events SET status='pending', worker_id=NULL, heartbeat_at=NULL, updated_at=? "
+        "WHERE status='running' AND (heartbeat_at IS NULL OR heartbeat_at < ?)",
+        (now(), cutoff),
     )
     conn.commit()
     return cur.rowcount
@@ -249,12 +303,13 @@ def _selftest() -> int:
     eid3, created3 = enqueue(conn, "manual", "cmyyy/wick#1")
     assert created3 is True and eid3 != eid1
 
-    # Atomic claim.
-    ev = claim_next(conn)
+    # Atomic claim records the owner and starts a lease.
+    ev = claim_next(conn, "w1")
     assert ev is not None and ev["status"] == "running" and ev["attempts"] == 1
-    ev2 = claim_next(conn)  # the manual row is still pending
-    assert ev2 is not None and ev2["id"] != ev["id"]
-    assert claim_next(conn) is None  # everything claimed
+    assert ev["worker_id"] == "w1" and ev["heartbeat_at"], dict(ev)
+    ev2 = claim_next(conn, "w2")  # the manual row is still pending
+    assert ev2 is not None and ev2["id"] != ev["id"] and ev2["worker_id"] == "w2"
+    assert claim_next(conn, "w3") is None  # everything claimed
 
     # State transition plus delivery.
     finish_event(conn, ev["id"], "done")
@@ -263,10 +318,32 @@ def _selftest() -> int:
     assert row["status"] == "done"
     assert conn.execute("SELECT COUNT(*) c FROM deliveries").fetchone()["c"] == 1
 
-    # Crash recovery: rows left running go back to pending.
+    # Issue #1: a claim whose heartbeat is fresh is NOT stale. A second worker
+    # starting up must leave it running rather than process it a second time.
+    assert requeue_stale(conn) == 0, "心跳新鲜的 running 事件被当成残留回收了"
+    assert conn.execute("SELECT status FROM events WHERE id=?", (ev2["id"],)).fetchone()["status"] == "running"
+
+    # A live worker renews its lease, so a long run never ages into "stale".
+    stale = (datetime.now(timezone.utc)
+             - timedelta(seconds=LEASE_SECONDS + 60)).isoformat(timespec="seconds")
+    conn.execute("UPDATE events SET heartbeat_at=? WHERE id=?", (stale, ev2["id"]))
+    conn.commit()
+    assert heartbeat(conn, ev2["id"], "w2") is True, "心跳应该续上自己的租约"
+    assert requeue_stale(conn) == 0
+
+    # Crash recovery: rows left running by a worker that stopped beating go back to pending.
+    conn.execute("UPDATE events SET heartbeat_at=? WHERE id=?", (stale, ev2["id"]))
+    conn.commit()
     n = requeue_stale(conn)
     assert n == 1, n  # only ev2 is still running
-    assert claim_next(conn)["id"] == ev2["id"]
+    row = conn.execute("SELECT status, worker_id FROM events WHERE id=?", (ev2["id"],)).fetchone()
+    assert row["status"] == "pending" and row["worker_id"] is None, dict(row)
+
+    # A beat on a finished or already-reclaimed event is refused, not applied.
+    assert heartbeat(conn, ev["id"], "w1") is False  # ev is done
+    assert heartbeat(conn, ev2["id"], "w2") is False  # ev2 is pending again
+
+    assert claim_next(conn, "w2")["id"] == ev2["id"]
 
     # Approval state machine.
     aid = request_approval(conn, ev["id"], "提 PR", {"repo": "cmyyy/wick"})
@@ -280,7 +357,7 @@ def _selftest() -> int:
         raise AssertionError("重复决策应该报错")
 
     conn.close()
-    print("db.py selftest OK: 去重 / 原子领取 / 状态流转 / 崩溃恢复 / 审批")
+    print("db.py selftest OK: 去重 / 原子领取 / 租约心跳 / 状态流转 / 崩溃恢复 / 审批")
     return 0
 
 
