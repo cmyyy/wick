@@ -138,9 +138,13 @@ def serve(conn, interval: int = POLL_INTERVAL, repo: str | None = None,
 
         process_approvals(conn)
         n = run_once(conn)
-        stats = outbox.drain(conn)  # separate step: producing a delivery is not sending it
-        if any(stats.values()):
-            log.info("投递: %s", stats)
+        try:
+            # separate step: producing a delivery is not sending it
+            stats = outbox.drain(conn)
+            if any(stats.values()):
+                log.info("投递: %s", stats)
+        except Exception:  # a lost claim race or a bad row must not kill the worker
+            log.exception("投递出错，下一轮重试")
         if n == 0:
             time.sleep(interval)
     log.info("worker 退出")
@@ -181,6 +185,76 @@ def _selftest() -> int:
         # An empty queue does nothing.
         assert run_once(conn) == 0
 
+        # End-to-end through the resident loop: serve() -> run_once -> outbox.drain
+        # -> a real subprocess that writes the body to a file. The assertions
+        # above only prove a delivery is *produced*; delete the drain call from
+        # serve() and this block is what goes red.
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            (tmp / "rec.py").write_text(
+                "import sys, pathlib\n"
+                "pathlib.Path(sys.argv[1]).write_text(sys.argv[2], encoding='utf-8')\n",
+                encoding="utf-8",
+            )
+            got = (tmp / "got.txt").resolve()
+            e2e = db.connect(tmp / "e2e.db")
+            try:
+                db.enqueue(e2e, "manual", "e2e-1", {"title": "端到端"})
+                saved_cmd = os.environ.get("WICK_SEND_CMD")
+                saved_sleep = time.sleep
+                os.environ["WICK_SEND_CMD"] = (
+                    f'"{sys.executable}" "{(tmp / "rec.py").resolve()}" "{got}"')
+
+                class _OneTick(Exception):
+                    pass
+
+                def _stop_after_tick(_seconds):  # one tick of the resident loop is enough
+                    raise _OneTick
+
+                time.sleep = _stop_after_tick
+                try:
+                    try:
+                        serve(e2e, interval=0)
+                    except _OneTick:
+                        pass
+                finally:
+                    time.sleep = saved_sleep
+                    if saved_cmd is None:
+                        os.environ.pop("WICK_SEND_CMD", None)
+                    else:
+                        os.environ["WICK_SEND_CMD"] = saved_cmd
+
+                assert got.exists(), "serve() 没把投递发出去（outbox.drain 还在 serve 里吗？）"
+                assert got.read_text(encoding="utf-8") == "[test] 处理了 e2e-1", \
+                    got.read_text(encoding="utf-8")
+                row = e2e.execute(
+                    "SELECT status, attempts FROM deliveries ORDER BY id DESC LIMIT 1").fetchone()
+                assert (row["status"], row["attempts"]) == ("sent", 1), dict(row)
+            finally:
+                e2e.close()
+
+        # A failing drain must not take the resident loop down either: this is
+        # how a lost claim race used to kill the worker. The next tick still runs.
+        stats_calls = {"n": 0}
+        real_drain = outbox.drain
+
+        def broken_drain(_conn, **_kw):
+            stats_calls["n"] += 1
+            raise ValueError("模拟投递异常：sent → sent")
+
+        outbox.drain = broken_drain
+        time.sleep = _stop_after_tick
+        try:
+            try:
+                serve(conn, interval=0)  # ValueError must be swallowed inside serve()
+            except _OneTick:
+                pass
+        finally:
+            outbox.drain = real_drain
+            time.sleep = saved_sleep
+        assert stats_calls["n"] >= 1, "serve() 没有调用 outbox.drain"
+
         # Failure isolation: a raising handle() marks the event failed, still emits a
         # delivery, and leaves the worker running.
         def boom(_conn, _event):
@@ -200,7 +274,7 @@ def _selftest() -> int:
     finally:
         handle = original
 
-    print("worker.py selftest OK: 进→处理→出 / 去重 / 空队列 / 失败隔离")
+    print("worker.py selftest OK: 进→处理→出 / 去重 / 空队列 / 失败隔离 / 常驻循环真发出投递")
     return 0
 
 
