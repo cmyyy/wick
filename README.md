@@ -102,6 +102,7 @@ wick/
 ├── src/
 │   ├── db.py          三张表 schema + 去重
 │   ├── worker.py      inbox 消费者（独立进程）
+│   ├── outbox.py      投递队列（日上限节流 / 指数退避重投 / 真实发消息）
 │   ├── sources/       事件源（github.py = since 增量轮询）
 │   └── prompts/       起 run 用的提示词
 ├── desktop/
