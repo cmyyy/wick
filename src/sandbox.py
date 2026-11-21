@@ -31,18 +31,28 @@ def _git(repo: Path, *args: str, timeout: int = 120) -> tuple[int, str]:
     return p.returncode, (p.stdout or "") + (p.stderr or "")
 
 
-def branch_name(event_id: int, issue_number: int | str) -> str:
-    return f"wick/issue-{issue_number}-run-{event_id}"
+def branch_name(event_id: int, issue_number: int | str, attempt: int) -> str:
+    """Branch for one attempt of one event.
+
+    `attempt` is part of the name on purpose. git refuses to check out the same
+    branch in two worktrees ("a branch named ... already exists"), and a retry
+    must never land on the worktree a stalled attempt is still editing -- so the
+    attempt gets its own path AND its own branch (issue #1).
+    """
+    return f"wick/issue-{issue_number}-run-{event_id}-attempt-{attempt}"
 
 
-def create(repo: Path, event_id: int, issue_number: int | str, base: str = "HEAD") -> tuple[Path, str]:
+def create(repo: Path, event_id: int, issue_number: int | str, base: str = "HEAD",
+           *, attempt: int) -> tuple[Path, str]:
     """Create one worktree on a fresh branch. Returns (worktree_path, branch)."""
-    branch = branch_name(event_id, issue_number)
+    branch = branch_name(event_id, issue_number, attempt)
     path = WORKTREE_ROOT / branch.replace("/", "-")
     WORKTREE_ROOT.mkdir(parents=True, exist_ok=True)
 
+    # Only this same attempt's leftovers can be here: a different attempt has a
+    # different path, so cleanup can never delete a worktree another worker is in.
     if path.exists():
-        remove(repo, path, branch)  # a retry of the same event must start clean
+        remove(repo, path, branch)
 
     rc, out = _git(repo, "worktree", "add", "-b", branch, str(path), base)
     if rc != 0:
@@ -92,8 +102,13 @@ def prune(repo: Path, keep_pattern: str | None = None) -> list[str]:
         if keep_pattern and not re.search(keep_pattern, p.name):
             continue
         name = p.name
-        m = re.match(r"wick-issue-(.+)-run-(\d+)$", name)
-        branch = f"wick/issue-{m.group(1)}-run-{m.group(2)}" if m else None
+        m = re.match(r"wick-issue-(.+)-run-(\d+)(?:-attempt-(\d+))?$", name)
+        if m:
+            branch = f"wick/issue-{m.group(1)}-run-{m.group(2)}"
+            if m.group(3):
+                branch += f"-attempt-{m.group(3)}"  # else the branch outlives the directory, silently
+        else:
+            branch = None
         remove(repo, p, branch)
         removed.append(name)
     return removed
@@ -120,8 +135,9 @@ def _selftest() -> int:
         original_root = WORKTREE_ROOT
         WORKTREE_ROOT = tmp / "wt"
         try:
-            path, branch = create(repo, event_id=7, issue_number=2)
-            assert path.exists() and branch == "wick/issue-2-run-7", (path, branch)
+            path, branch = create(repo, event_id=7, issue_number=2, attempt=1)
+            assert path.exists() and branch == "wick/issue-2-run-7-attempt-1", (path, branch)
+            assert path.name == "wick-issue-2-run-7-attempt-1", path  # attempt 也进路径
 
             # The main tree must be untouched by an edit inside the worktree.
             (path / "a.py").write_text("x = 2\ny = 3\n", encoding="utf-8")
@@ -134,17 +150,31 @@ def _selftest() -> int:
             assert "+x = 2" in d["patch"] and "+z = 9" in d["patch"], d["patch"][:300]
             assert "new_file.py" in d["patch"], "untracked file missing from patch"
 
-            # Re-creating the same event's worktree starts from a clean base.
-            path2, _ = create(repo, event_id=7, issue_number=2)
-            assert (path2 / "a.py").read_text(encoding="utf-8") == "x = 1\n"
+            # Issue #1 缺陷3：下一次尝试要落在另一个路径和另一个分支上。同一个分支
+            # 不能同时 checkout 在两个 worktree（git 直接 rc=255），而共用路径会让
+            # 接手的那次静默删掉前一次还在用的 worktree。
+            path_b, branch_b = create(repo, event_id=7, issue_number=2, attempt=2)
+            assert path_b != path and branch_b == "wick/issue-2-run-7-attempt-2", (path_b, branch_b)
+            assert path.exists(), "attempt 2 把 attempt 1 的 worktree 删了"
+            assert (path / "a.py").read_text(encoding="utf-8") == "x = 2\ny = 3\n", "两个 attempt 共用了同一个 worktree"
+            listed = _git(repo, "branch", "--list", "wick/*")[1]
+            assert "wick/issue-2-run-7-attempt-1" in listed and branch_b in listed, listed
 
+            # Re-creating the same attempt starts from a clean base.
+            path2, _ = create(repo, event_id=7, issue_number=2, attempt=1)
+            assert path2 == path and (path2 / "a.py").read_text(encoding="utf-8") == "x = 1\n"
+
+            # Cleanup must take the branches too, attempt suffix included: a prune
+            # that only deletes directories leaves branches behind, silently.
             removed = prune(repo)
-            assert removed, removed
-            assert not path2.exists()
+            assert set(removed) == {"wick-issue-2-run-7-attempt-1",
+                                    "wick-issue-2-run-7-attempt-2"}, removed
+            assert not path2.exists() and not path_b.exists()
+            assert _git(repo, "branch", "--list", "wick/*")[1].strip() == "", _git(repo, "branch", "--list", "wick/*")[1]
         finally:
             WORKTREE_ROOT = original_root
 
-    print("sandbox.py selftest OK: 建 worktree / 主树隔离 / diff 含未跟踪文件 / 清理")
+    print("sandbox.py selftest OK: 建 worktree / 主树隔离 / diff 含未跟踪文件 / attempt 隔离 / 清理连分支")
     return 0
 
 
