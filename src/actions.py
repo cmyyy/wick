@@ -72,6 +72,44 @@ def open_pr(worktree: Path, repo: str, branch: str, base: str,
     raise RuntimeError(f"gh pr create 没有返回 PR 链接: {out[-300:]}")
 
 
+def _commit_prefix(labels: list[str]) -> str:
+    """Map an issue's labels to a conventional commit prefix.
+
+    Ordered by specificity: a docs-only issue labelled both `docs` and `chore`
+    should read `docs:`. Defaults to `fix` because most issues are reports.
+    """
+    for label, prefix in (
+        ("docs", "docs"), ("documentation", "docs"),
+        ("chore", "chore"), ("refactor", "refactor"),
+        ("enhancement", "feat"), ("feature", "feat"),
+        ("bug", "fix"), ("reliability", "fix"), ("tech-debt", "fix"),
+    ):
+        if any(label == str(x).lower() for x in labels):
+            return prefix
+    return "fix"
+
+
+def _pr_body(detail: dict, branch: str, sha: str, number: int | str, repo: str) -> str:
+    """PR body with the three sections CONTRIBUTING requires."""
+    files = detail.get("files") or []
+    files_block = "\n".join(f"- `{f}`" for f in files[:20]) or "- （未记录）"
+    summary = (detail.get("summary") or "").strip() or "（见 diff）"
+    checks = detail.get("checks") or "?"
+    return (
+        f"Closes #{number}\n\n"
+        f"## 改了什么\n\n{summary}\n\n"
+        f"改动文件（{len(files)} 个，{detail.get('diff', '?')}）：\n\n{files_block}\n\n"
+        f"## 怎么验证的\n\n"
+        f"wick 在 worktree 里跑了项目的自检，{checks} 项全绿。"
+        f"自检由 worker 实际执行，不是 agent 自报。\n\n"
+        f"## 遗留\n\n"
+        f"无。若 review 中发现，补在评论里。\n\n"
+        f"---\n\n"
+        f"由 [wick](https://github.com/{repo}) 在人工批准后自动提交。\n"
+        f"- 分支 `{branch}`\n- commit `{sha}`\n"
+    )
+
+
 def execute_approval(approval: dict, worktree: Path) -> dict:
     """Carry out one approved action. `approval` is the row's detail as a dict."""
     action = approval.get("action") or "提 PR"
@@ -79,7 +117,8 @@ def execute_approval(approval: dict, worktree: Path) -> dict:
     branch = approval["branch"]
     base = approval.get("base", "main")
     number = approval.get("number", "?")
-    title = approval.get("title") or f"fix: issue #{number}"
+    title = approval.get("title") or f"issue #{number}"
+    prefix = _commit_prefix(approval.get("labels") or [])
 
     if action not in ("提 PR", "open_pr"):
         raise RuntimeError(f"不认识的动作: {action}")
@@ -89,15 +128,14 @@ def execute_approval(approval: dict, worktree: Path) -> dict:
 
     sha = commit_and_push(
         worktree, branch,
-        f"fix: {title} (#{number})\n\nAutomated by wick after human approval.\nApproved action: {action}",
+        f"{prefix}: {title} (#{number})\n\n"
+        f"Automated by wick after a human approved the action.\n"
+        f"Approved action: {action}\n",
     )
     url = open_pr(
         worktree, repo, branch, base,
-        f"fix: {title} (#{number})",
-        f"Closes #{number}\n\n"
-        f"Automated by [wick](https://github.com/{repo}) after a human approved the action.\n\n"
-        f"- Branch: `{branch}`\n- Commit: `{sha}`\n"
-        f"- The project's four self-checks pass inside the worktree.\n",
+        f"{prefix}: {title} (#{number})",
+        _pr_body(approval, branch, sha, number, repo),
     )
     return {"commit": sha, "url": url}
 
@@ -155,7 +193,35 @@ def _selftest() -> int:
         else:
             raise AssertionError("缺失 worktree 应该被拒绝")
 
-    print("actions.py selftest OK: 空提交拒绝 / commit+push 落地 / 未知动作拒绝")
+    # Commit prefix follows the issue's labels instead of a hardcoded `fix:`.
+    assert _commit_prefix(["docs"]) == "docs"
+    assert _commit_prefix(["documentation"]) == "docs"
+    assert _commit_prefix(["chore"]) == "chore"
+    assert _commit_prefix(["enhancement"]) == "feat"
+    assert _commit_prefix(["bug"]) == "fix"
+    assert _commit_prefix(["tech-debt"]) == "fix"
+    assert _commit_prefix([]) == "fix"
+    assert _commit_prefix(["Docs"]) == "docs", "label matching must be case-insensitive"
+    assert _commit_prefix(["reliability", "docs"]) == "docs", "docs wins over a fix-ish label"
+
+    # The PR body must carry the three sections CONTRIBUTING requires.
+    body = _pr_body(
+        {"files": ["a.py", "b.py"], "diff": "+10/-2", "summary": "改了 a.py 的连接泄漏",
+         "checks": "9/9"},
+        "wick/issue-1-run-1", "abc1234", 1, "cmyyy/wick",
+    )
+    for section in ("Closes #1", "## 改了什么", "## 怎么验证的", "## 遗留"):
+        assert section in body, f"PR body 缺 {section}"
+    assert "改了 a.py 的连接泄漏" in body and "9/9" in body
+    assert "`a.py`" in body and "`b.py`" in body
+    assert "abc1234" in body and "wick/issue-1-run-1" in body
+
+    # Empty detail must still produce a valid, sectioned body.
+    bare = _pr_body({}, "b", "sha", 2, "a/b")
+    assert "## 改了什么" in bare and "（见 diff）" in bare, bare[:200]
+
+    print("actions.py selftest OK: 空提交拒绝 / commit+push 落地 / 未知动作拒绝 / "
+          "commit 前缀按 label / PR body 三节")
     return 0
 
 
