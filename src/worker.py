@@ -18,9 +18,12 @@ import os
 import signal
 import socket
 import sqlite3
+import subprocess
 import sys
+import tempfile
 import threading
 import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
@@ -91,20 +94,30 @@ def _renew_lease(conn, event_id: int, stop: threading.Event) -> None:
     """Keep the claim alive while handle() runs; a real run takes minutes.
 
     A failed beat is not fatal: the row just ages, and the run's own finish_event
-    still lands. Losing ownership entirely is only possible if the lease expired
-    and another worker reclaimed it -- then the beat is refused and we stop.
+    still lands. So the try is INSIDE the loop -- one `database is locked` (30s
+    busy timeout, some other writer holding the DB) must cost one beat, not the
+    rest of a 25-minute run, which would otherwise age into a needless reclaim.
+    Losing ownership entirely is only possible if the lease expired and another
+    worker reclaimed it -- then the beat is refused and we stop.
     """
-    try:
-        while not stop.wait(HEARTBEAT_INTERVAL):
+    while not stop.wait(HEARTBEAT_INTERVAL):
+        try:
             if not db.heartbeat(conn, event_id, WORKER_ID):
                 log.warning("事件 %s 的租约已不属于本 worker，停止心跳", event_id)
                 return
-    except sqlite3.Error as exc:  # db gone/closed mid-run: let the claim expire normally
-        log.warning("事件 %s 心跳失败：%s", event_id, exc)
+        except sqlite3.Error as exc:  # transient: db busy/closed mid-run, keep trying
+            log.warning("事件 %s 心跳失败（下一拍重试）：%s", event_id, exc)
+            continue
 
 
 def run_once(conn) -> int:
-    """Drain the queue, returning how many events were processed."""
+    """Drain the queue, returning how many events were processed.
+
+    Every write after handle() is fenced on the claim. If the lease was reclaimed
+    and handed to another worker meanwhile, this attempt's result is superseded:
+    drop it -- no delivery, no status change, no approval. Otherwise one recovery
+    would deliver the same event twice (issue #1).
+    """
     processed = 0
     while True:
         ev = db.claim_next(conn, WORKER_ID)
@@ -117,7 +130,9 @@ def run_once(conn) -> int:
             text = handle(conn, ev)
         except Exception as exc:  # one bad event must not take the worker down
             log.exception("事件 %s 处理失败", ev["id"])
-            db.finish_event(conn, ev["id"], "failed", repr(exc))
+            if not db.finish_event(conn, ev["id"], "failed", WORKER_ID, ev["attempts"], repr(exc)):
+                log.warning("事件 %s 已被回收并转交，丢弃本次失败结果", ev["id"])
+                continue
             # str(exc), not repr: a failed D4 run carries the whole review report.
             db.add_delivery(conn, ev["id"],
                             f"处理失败：{ev['source_type']}:{ev['source_id']}\n\n{exc}")
@@ -125,7 +140,10 @@ def run_once(conn) -> int:
         finally:
             stop.set()   # the lease thread exits at its next wait
             beat.join()
-        db.finish_event(conn, ev["id"], "done")
+        if not db.finish_event(conn, ev["id"], "done", WORKER_ID, ev["attempts"]):
+            log.warning("事件 %s 已被回收并转交（attempts=%s），丢弃本次结果",
+                        ev["id"], ev["attempts"])
+            continue
         db.add_delivery(conn, ev["id"], text)
         processed += 1
         log.info("done #%s %s:%s", ev["id"], ev["source_type"], ev["source_id"])
@@ -250,12 +268,99 @@ def _selftest() -> int:
             "SELECT COUNT(*) c FROM deliveries WHERE body LIKE '处理失败%'"
         ).fetchone()["c"] == 1
 
+        # Issue #1 缺陷1（worker 端）：交付前租约被回收并转交，本次结果必须整体丢弃。
+        # 心跳间隔调大，下面的人为回收才不会被心跳线程抢回去。
+        HEARTBEAT_INTERVAL = 3600
+        stale_ts = (datetime.now(timezone.utc)
+                    - timedelta(seconds=db.LEASE_SECONDS + 60)).isoformat(timespec="seconds")
+
+        def steal(inner_conn, ev):
+            """模拟另一台 worker 接手：本 worker 停拍 -> 租约超时 -> 被别人领走。"""
+            inner_conn.execute("UPDATE events SET heartbeat_at=? WHERE id=?", (stale_ts, ev["id"]))
+            inner_conn.commit()
+            db.requeue_stale(inner_conn)
+            thief = db.claim_next(inner_conn, "worker-B")
+            assert thief is not None and thief["id"] == ev["id"], dict(thief or {})
+            return "[test] A 的迟到结果"
+
+        def deliveries(inner_conn) -> int:
+            return inner_conn.execute("SELECT COUNT(*) c FROM deliveries").fetchone()["c"]
+
+        handle = steal
+        db.enqueue(conn, "manual", "stolen-1", {"title": "被抢走的那条"})
+        before = deliveries(conn)
+        assert run_once(conn) == 0, "被转交的事件不该算本 worker 处理成功"
+        row = conn.execute("SELECT status, worker_id, attempts, error FROM events "
+                           "WHERE source_id='stolen-1'").fetchone()
+        assert (row["status"], row["worker_id"], row["attempts"]) == ("running", "worker-B", 2), dict(row)
+        assert row["error"] is None, dict(row)
+        assert deliveries(conn) == before, "迟到的成功结果被投递了"
+
+        # 迟到的是失败结果也一样：不覆盖新 worker 的状态、不投递。
+        def steal_then_fail(inner_conn, ev):
+            steal(inner_conn, ev)
+            raise RuntimeError("A 迟到的失败")
+
+        handle = steal_then_fail
+        db.enqueue(conn, "manual", "stolen-2", {"title": "被抢走后失败的那条"})
+        before = deliveries(conn)
+        assert run_once(conn) == 0
+        row = conn.execute("SELECT status, worker_id, error FROM events "
+                           "WHERE source_id='stolen-2'").fetchone()
+        assert row["status"] == "running" and row["worker_id"] == "worker-B", dict(row)
+        assert row["error"] is None, dict(row)
+        assert deliveries(conn) == before, "迟到的失败结果被投递了"
+
+        # Issue #1 缺陷2：一次心跳抛错不能把心跳线程打死（一次 DB 抖动 = 全程不心跳）。
+        HEARTBEAT_INTERVAL = 0.05
+        beats = {"n": 0}
+        real_beat = db.heartbeat
+
+        def flaky_beat(inner_conn, event_id, worker_id):
+            beats["n"] += 1
+            if beats["n"] == 1:
+                raise sqlite3.OperationalError("database is locked")
+            return real_beat(inner_conn, event_id, worker_id)
+
+        def slow_after_blip(inner_conn, ev):
+            time.sleep(1.2)  # 第一拍炸掉之后，线程还得继续拍
+            return "[test] 心跳抖动后仍在拍"
+
+        db.heartbeat = flaky_beat
+        try:
+            handle = slow_after_blip
+            db.enqueue(conn, "manual", "flaky-1", {"title": "心跳抖了一下"})
+            assert run_once(conn) == 1
+        finally:
+            db.heartbeat = real_beat
+        assert beats["n"] >= 3, f"心跳线程在第一次报错后就退出了: {beats}"
+        assert conn.execute("SELECT status FROM events WHERE source_id='flaky-1'"
+                            ).fetchone()["status"] == "done"
+
+        # Issue #1 缺陷5：--once 也要做崩溃恢复（演示和调试都走这个入口）。
+        with tempfile.TemporaryDirectory() as td:
+            once_db = Path(td) / "once.db"
+            c2 = db.connect(once_db)
+            db.enqueue(c2, "manual", "stale-once", {"title": "崩溃遗留的那条"})
+            c2.execute("UPDATE events SET status='running', worker_id='dead-worker', "
+                       "heartbeat_at=?, attempts=1 WHERE source_id='stale-once'", (stale_ts,))
+            c2.commit()
+            c2.close()  # the crashed worker's connection is gone; only the row remains
+            p = subprocess.run(
+                [sys.executable, str(Path(__file__).parent / "worker.py"),
+                 "--once", "--db", str(once_db)],
+                capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=120,
+            )
+            assert p.returncode == 0, (p.stdout, p.stderr)
+            assert "处理了 1 条事件" in p.stdout, p.stdout + p.stderr
+
         conn.close()
     finally:
         handle = original
         HEARTBEAT_INTERVAL = original_beat
 
-    print("worker.py selftest OK: 进→处理→出 / 去重 / 空队列 / 租约心跳 / 失败隔离")
+    print("worker.py selftest OK: 进→处理→出 / 去重 / 空队列 / 租约心跳 / 失败隔离 / "
+          "被抢后丢弃结果 / 心跳抖动不断线 / --once 回收")
     return 0
 
 
@@ -283,6 +388,9 @@ def main() -> int:
     conn = db.connect(args.db or db.DEFAULT_DB)
     try:
         if args.once:
+            n = db.requeue_stale(conn)  # --once is how demos and debugging run: recover here too
+            if n:
+                log.warning("回收了 %s 条心跳超时的事件", n)
             if args.repo:
                 poll_github(conn, args.repo)  # --once also refreshes the source
             ran = process_approvals(conn)

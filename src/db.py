@@ -9,6 +9,10 @@ Design notes (see DECISIONS.md #6):
   never grab the same row, and the claim records who holds it (worker_id) and a
   lease (heartbeat_at). A claim only dies of old age: requeue_stale() reclaims
   rows whose worker stopped beating, never rows a live worker is still on.
+- Every write that a claim owns (heartbeat, finish_event, request_approval) is
+  fenced on (worker_id, attempts). A reclaimed worker runs on after its lease is
+  gone; fencing is what makes its late verdict a no-op instead of a second
+  delivery and a status overwrite.
 
 ponytail: one worker per inbox on purpose (upstream advice, and two concurrent
 runs would edit the same files). The lease exists so that starting a second
@@ -186,14 +190,23 @@ def heartbeat(conn: sqlite3.Connection, event_id: int, worker_id: str) -> bool:
 
 
 def finish_event(conn: sqlite3.Connection, event_id: int, status: str,
-                 error: str | None = None) -> None:
+                 worker_id: str, attempts: int, error: str | None = None) -> bool:
+    """Complete one in-flight event. False when the claim is no longer ours.
+
+    Fenced like heartbeat(): if the lease expired and another worker re-claimed
+    the row, this attempt's verdict describes work that was already superseded.
+    Applying it would overwrite the live attempt's status and error while its own
+    delivery is still on the way -- so the caller must drop the result instead.
+    """
     if status not in ("done", "failed"):
         raise ValueError(f"finish_event 只接受 done/failed，收到 {status}")
-    conn.execute(
-        "UPDATE events SET status=?, error=?, updated_at=? WHERE id=?",
-        (status, error, now(), event_id),
+    cur = conn.execute(
+        "UPDATE events SET status=?, error=?, updated_at=? "
+        "WHERE id=? AND worker_id=? AND attempts=? AND status='running'",
+        (status, error, now(), event_id, worker_id, attempts),
     )
     conn.commit()
+    return cur.rowcount == 1
 
 
 def requeue_stale(conn: sqlite3.Connection) -> int:
@@ -230,13 +243,44 @@ def add_delivery(conn: sqlite3.Connection, event_id: int | None, body: str,
 # --------------------------------------------------------------- approvals
 
 def request_approval(conn: sqlite3.Connection, event_id: int | None, action: str,
-                     detail: dict[str, Any] | None = None) -> int:
-    cur = conn.execute(
-        "INSERT INTO approvals (event_id, action, detail, created_at) VALUES (?,?,?,?)",
-        (event_id, action, json.dumps(detail or {}, ensure_ascii=False), now()),
+                     detail: dict[str, Any] | None = None, *,
+                     worker_id: str | None = None,
+                     attempts: int | None = None) -> int | None:
+    """Queue one approval. Returns its id, or None when the claim was superseded.
+
+    With worker_id/attempts the insert is fenced like finish_event(): a worker
+    whose lease was reclaimed must not queue irreversible work for an event it no
+    longer owns. Without them the insert is unowned (CLI, tests) and only deduped.
+
+    Dedupe: a newer approval expires the older `waiting` ones on the same event.
+    Attempt N's branch is not attempt N-1's, and a superseded approval would open
+    a second PR for the same fix -- an unattended, irreversible duplicate.
+    """
+    ts = now()
+    detail_json = json.dumps(detail or {}, ensure_ascii=False)
+    if worker_id is None:
+        cur = conn.execute(
+            "INSERT INTO approvals (event_id, action, detail, created_at) VALUES (?,?,?,?)",
+            (event_id, action, detail_json, ts),
+        )
+    else:
+        cur = conn.execute(
+            "INSERT INTO approvals (event_id, action, detail, created_at) "
+            "SELECT ?,?,?,? WHERE EXISTS ("
+            "SELECT 1 FROM events WHERE id=? AND worker_id=? AND attempts=? AND status='running')",
+            (event_id, action, detail_json, ts, event_id, worker_id, attempts),
+        )
+    if cur.rowcount != 1:
+        conn.commit()
+        return None
+    aid = int(cur.lastrowid)
+    conn.execute(
+        "UPDATE approvals SET status='expired', decided_at=? "
+        "WHERE event_id=? AND status='waiting' AND id<>?",
+        (ts, event_id, aid),
     )
     conn.commit()
-    return int(cur.lastrowid)
+    return aid
 
 
 def decide_approval(conn: sqlite3.Connection, approval_id: int, approved: bool) -> None:
@@ -312,7 +356,7 @@ def _selftest() -> int:
     assert claim_next(conn, "w3") is None  # everything claimed
 
     # State transition plus delivery.
-    finish_event(conn, ev["id"], "done")
+    assert finish_event(conn, ev["id"], "done", "w1", 1) is True
     add_delivery(conn, ev["id"], "已处理：断点续跑失败")
     row = conn.execute("SELECT status FROM events WHERE id=?", (ev["id"],)).fetchone()
     assert row["status"] == "done"
@@ -345,6 +389,52 @@ def _selftest() -> int:
 
     assert claim_next(conn, "w2")["id"] == ev2["id"]
 
+    # Issue #1 缺陷1：租约被回收并转交后，旧 worker 的每条写路径都必须被拒。
+    # 不然它会覆盖新 worker 的状态、多投一条 delivery、再入一条审批。
+    eid4, _ = enqueue(conn, "manual", "fence-1")
+    a = claim_next(conn, "worker-A")
+    assert a["id"] == eid4 and a["attempts"] == 1, dict(a)
+    conn.execute("UPDATE events SET heartbeat_at=? WHERE id=?", (stale, eid4))
+    conn.commit()
+    assert requeue_stale(conn) == 1
+    # 回收后还没被接手（pending）：旧 worker 说什么都不算数。
+    assert finish_event(conn, eid4, "done", "worker-A", 1) is False
+    b = claim_next(conn, "worker-B")
+    assert b["worker_id"] == "worker-B" and b["attempts"] == 2, dict(b)
+    assert heartbeat(conn, eid4, "worker-A") is False
+    assert finish_event(conn, eid4, "failed", "worker-A", 1, "A 的错") is False
+    assert request_approval(conn, eid4, "提 PR", {"repo": "a/b"},
+                            worker_id="worker-A", attempts=1) is None
+    row = conn.execute("SELECT * FROM events WHERE id=?", (eid4,)).fetchone()
+    assert row["status"] == "running" and row["error"] is None, dict(row)  # 新 worker 的状态没被覆盖
+    assert row["worker_id"] == "worker-B" and row["attempts"] == 2, dict(row)
+    assert conn.execute("SELECT COUNT(*) c FROM approvals WHERE event_id=?",
+                        (eid4,)).fetchone()["c"] == 0
+    # 真正的主人照常写得进去。
+    assert finish_event(conn, eid4, "done", "worker-B", 2) is True
+
+    # 事件已经结束之后，即使携带正确的 owner/attempt，也不能再开审批。
+    # 没有这条，把 EXISTS 里的 status='running' 放宽成 IN ('running','done')
+    # 也不会有任何断言变红——审批会在事件早已投递完之后凭空多出来一条。
+    assert request_approval(conn, eid4, "提 PR", {"late": True},
+                            worker_id="worker-B", attempts=2) is None
+
+    # Issue #1 缺陷4：同一事件来了新审批，旧的 waiting 审批作废——否则两次批准
+    # 会各开一个 PR（attempt 已进分支名，git/gh 层面不再天然拦重复）。
+    aid_old = request_approval(conn, eid4, "提 PR", {"branch": "old"})
+    aid_new = request_approval(conn, eid4, "提 PR", {"branch": "new"})
+    assert aid_old and aid_new and aid_old != aid_new, (aid_old, aid_new)
+    st = {r["id"]: r["status"] for r in conn.execute(
+        "SELECT id, status FROM approvals WHERE event_id=? AND id IN (?,?)",
+        (eid4, aid_old, aid_new))}
+    assert st == {aid_old: "expired", aid_new: "waiting"}, st
+    try:
+        decide_approval(conn, aid_old, True)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("被作废的旧审批不该还能批准")
+
     # Approval state machine.
     aid = request_approval(conn, ev["id"], "提 PR", {"repo": "cmyyy/wick"})
     decide_approval(conn, aid, True)
@@ -357,7 +447,7 @@ def _selftest() -> int:
         raise AssertionError("重复决策应该报错")
 
     conn.close()
-    print("db.py selftest OK: 去重 / 原子领取 / 租约心跳 / 状态流转 / 崩溃恢复 / 审批")
+    print("db.py selftest OK: 去重 / 原子领取 / 租约心跳 / 状态流转 / 崩溃恢复 / 写路径 fence / 审批去重")
     return 0
 
 
