@@ -542,7 +542,12 @@ def _selftest() -> int:
 
 def main() -> int:
     if "--drain" in sys.argv[1:]:
+        import logging
         import db
+        # Without basicConfig, a failed send (say, a missing chat_id) is swallowed
+        # into log.info and --drain only prints "retrying": the whole point of
+        # resolve_target()'s loud error would be lost here.
+        logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
         conn = db.connect()
         try:
             print(f"投递: {drain(conn)}")
