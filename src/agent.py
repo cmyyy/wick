@@ -32,6 +32,11 @@ CHECKS = [
     ["src/db.py"],
     ["src/worker.py", "--selftest"],
     ["src/sources/github.py"],
+    ["src/agent.py"],
+    ["src/sandbox.py"],
+    ["src/actions.py"],
+    ["src/cli.py", "selftest"],
+    ["src/outbox.py"],
     ["eval/run.py", "--selftest"],
 ]
 
@@ -220,6 +225,7 @@ def handle_issue_fix(conn, event) -> str:
         "branch": branch,
         "base": "main",
         "title": payload.get("title"),
+        "labels": payload.get("labels") or [],
         "worktree": str(worktree),
         "files": changes["files"],
         "diff": f"+{changes['lines_added']}/-{changes['lines_removed']}",
@@ -228,6 +234,10 @@ def handle_issue_fix(conn, event) -> str:
         # that queued an approval and then lost its lease would still open a PR
         # from a stale worktree.
         "attempts": event["attempts"],
+        # Enough context for the PR body to carry the three sections CONTRIBUTING
+        # asks for, without re-reading the agent's transcript later.
+        "summary": text[:2000],
+        "checks": f"{checks['passed']}/{checks['total']}",
     }, worker_id=event["worker_id"], attempts=event["attempts"])
     if approval_id is None:
         # The lease was reclaimed while we worked: some other attempt owns the
@@ -282,15 +292,18 @@ def _selftest() -> int:
         (wt / "src").mkdir()
         (wt / "eval").mkdir()
         good = "print('ok')\n"
-        for rel in ("src/db.py", "src/worker.py", "src/sources/github.py", "eval/run.py"):
+        for rel in ("src/db.py", "src/worker.py", "src/sources/github.py", "src/agent.py",
+                    "src/sandbox.py", "src/actions.py", "src/cli.py", "src/outbox.py",
+                    "eval/run.py"):
             (wt / rel).parent.mkdir(parents=True, exist_ok=True)
             (wt / rel).write_text(good, encoding="utf-8")
         checks = run_checks(wt)
-        assert checks["all_ok"] and checks["passed"] == 4, checks
+        total = len(CHECKS)
+        assert checks["all_ok"] and checks["passed"] == total, checks
 
         (wt / "src" / "db.py").write_text("raise SystemExit(1)\n", encoding="utf-8")
         checks = run_checks(wt)
-        assert not checks["all_ok"] and checks["passed"] == 3, checks
+        assert not checks["all_ok"] and checks["passed"] == total - 1, checks
         assert "src/db.py" in _checks_line(checks)
 
     print("agent.py selftest OK: 模板渲染 / 判定解析 / 自检真能失败")
