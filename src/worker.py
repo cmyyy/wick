@@ -28,6 +28,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 import db  # noqa: E402
+import outbox  # noqa: E402
 
 log = logging.getLogger("wick.worker")
 
@@ -229,7 +230,11 @@ def serve(conn, interval: int = POLL_INTERVAL, repo: str | None = None,
 
         if process_approvals(conn):
             continue  # an approved action just produced deliveries; drain the queue too
-        if run_once(conn) == 0:
+        n = run_once(conn)
+        stats = outbox.drain(conn)  # separate step: producing a delivery is not sending it
+        if any(stats.values()):
+            log.info("投递: %s", stats)
+        if n == 0:
             # Idle is when a dead worker's claim becomes visible: reclaim it and
             # loop again instead of sleeping on it. Recovery needs no restart.
             if db.requeue_stale(conn):
@@ -266,6 +271,10 @@ def _selftest() -> int:
         deliveries = conn.execute("SELECT body FROM deliveries ORDER BY id").fetchall()
         assert len(deliveries) == 2, deliveries
         assert "cmyyy/wick#1" in deliveries[0]["body"], deliveries[0]["body"]
+        # run_once only produces deliveries; outbox.drain is what sends them.
+        assert conn.execute(
+            "SELECT COUNT(*) c FROM deliveries WHERE status='queued'"
+        ).fetchone()["c"] == 2
 
         # An empty queue does nothing.
         assert run_once(conn) == 0
@@ -474,6 +483,7 @@ def main() -> int:
                 print(f"执行了 {ran} 个已批准的动作")
             n = run_once(conn)
             print(f"处理了 {n} 条事件")
+            print(f"投递: {outbox.drain(conn)}")
             return 0
         serve(conn, args.interval, args.repo, args.github_interval)
         return 0
