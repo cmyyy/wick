@@ -223,6 +223,11 @@ def handle_issue_fix(conn, event) -> str:
         "worktree": str(worktree),
         "files": changes["files"],
         "diff": f"+{changes['lines_added']}/-{changes['lines_removed']}",
+        # Which attempt this approval belongs to. process_approvals refuses an
+        # approval whose attempt no longer owns the event: otherwise an attempt
+        # that queued an approval and then lost its lease would still open a PR
+        # from a stale worktree.
+        "attempts": event["attempts"],
     }, worker_id=event["worker_id"], attempts=event["attempts"])
     if approval_id is None:
         # The lease was reclaimed while we worked: some other attempt owns the
