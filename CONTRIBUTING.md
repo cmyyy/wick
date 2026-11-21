@@ -70,6 +70,22 @@ python eval/run.py --selftest
 - body 说清三件事：改了什么、怎么验证的、遗留什么
 - **不自己 merge**
 
+## 这些规则怎么强制
+
+写在这里的规则，一部分能被机制强制，一部分只能靠约定。**分清楚比假装都强制了更有用。**
+
+**机制强制的（2026-11-21 起）**
+
+- `main` 已开 branch protection：禁止 force push、禁止删除分支
+
+**无法用 GitHub 机制闭环的**
+
+- **"必须走 PR"和"agent 不 merge"**：GitHub 的 `required_pull_request_reviews` 要求至少 1 个 approval，而单人仓库里作者不能批准自己的 PR——开了等于把整个仓库锁死。所以没开。
+- 真正的约束是两件事：① `src/actions.py` 里**没有 merge 路径**（只有 commit / push / PR），agent 即使想 merge 也没有那条代码；② 人 review 每个 PR。
+- 要机制化，需要第二个账号（bot reviewer）或 CI 门禁——都超出当前范围。
+
+**结论**：这条规则是**约定 + 能力缺失**，不是强制。任何文档都不该把它写成"已经强制"。等真有第二个账号时再改这一节。
+
 ## 唯一的例外
 
 **只有人能这么做。agent 任何时候都不行。**
