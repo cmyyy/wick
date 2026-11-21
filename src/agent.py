@@ -219,9 +219,14 @@ def handle_issue_fix(conn, event) -> str:
         "branch": branch,
         "base": "main",
         "title": payload.get("title"),
+        "labels": payload.get("labels") or [],
         "worktree": str(worktree),
         "files": changes["files"],
         "diff": f"+{changes['lines_added']}/-{changes['lines_removed']}",
+        # Enough context for the PR body to carry the three sections CONTRIBUTING
+        # asks for, without re-reading the agent's transcript later.
+        "summary": text[:2000],
+        "checks": f"{checks['passed']}/{checks['total']}",
     })
     return compose_fix_report(payload, text, None, checks, changes, worktree, branch,
                               approval_id=approval_id)
