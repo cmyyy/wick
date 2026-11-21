@@ -60,11 +60,43 @@ def handle(conn, event) -> str:
     return f"[占位] 处理了 {event['source_type']}:{event['source_id']} — {title}"
 
 
+def _refusal_reason(conn, row, detail: dict) -> str | None:
+    """Why this approved action must not run, or None when it should.
+
+    Three windows matter, and each has bitten a real flow:
+
+    1. The event must have finished. An approval queued by an attempt that then
+       lost its lease arrives while the new attempt is still running; executing
+       it would open a PR from the stale worktree.
+    2. The approval must belong to the attempt that finished the event.
+    3. One event runs at most one approval, otherwise two attempts mean two PRs.
+    """
+    ev = conn.execute("SELECT status, attempts FROM events WHERE id=?",
+                      (row["event_id"],)).fetchone()
+    if ev is None:
+        return "事件不存在"
+    if ev["status"] not in ("done", "failed"):
+        return f"事件当前状态是 {ev['status']}，不是已结束——审批来自一个已被回收的尝试"
+
+    want = detail.get("attempts")
+    if want is not None and ev["attempts"] != want:
+        return f"审批属于 attempt {want}，而事件现在是 attempt {ev['attempts']}"
+
+    earlier = conn.execute(
+        "SELECT id FROM approvals WHERE event_id=? AND executed_at IS NOT NULL AND id<?",
+        (row["event_id"], row["id"])).fetchone()
+    if earlier is not None:
+        return f"同一事件已有更早的审批 #{earlier['id']} 执行过（避免重复 PR）"
+    return None
+
+
 def process_approvals(conn) -> int:
     """Carry out approvals the user has granted. Returns how many ran.
 
     This is the only path that performs irreversible work, and it only ever
-    looks at rows a human marked approved.
+    looks at rows a human marked approved. It also refuses approvals that no
+    longer describe reality: an attempt that queued an approval and then lost
+    its lease must not open a PR from a worktree the next attempt has taken over.
     """
     import actions
 
@@ -72,6 +104,17 @@ def process_approvals(conn) -> int:
     for row in db.approved_undone(conn):
         detail = json.loads(row["detail"] or "{}")
         detail.setdefault("action", row["action"])
+
+        refusal = _refusal_reason(conn, row, detail)
+        if refusal:
+            # Recorded as executed-once with the reason, so it is not retried
+            # forever and a human can see why nothing happened.
+            db.mark_executed(conn, row["id"], error=refusal)
+            db.add_delivery(conn, row["event_id"],
+                            f"审批 #{row['id']} 未执行：{refusal}")
+            log.warning("审批 %s 被拒执行：%s", row["id"], refusal)
+            continue
+
         worktree = Path(detail.get("worktree") or "")
         try:
             result = actions.execute_approval(detail, worktree)
@@ -359,8 +402,41 @@ def _selftest() -> int:
         handle = original
         HEARTBEAT_INTERVAL = original_beat
 
+    # process_approvals 的三道门。缺任何一道，一个失去租约的尝试都能留下一份
+    # 能被批准、并且真的会去开 PR 的审批。
+    gate = db.connect(":memory:")
+    geid, _ = db.enqueue(gate, "manual", "gate-1", {"title": "门测试"})
+    gev = db.claim_next(gate, "w-gate")
+    gaid = db.request_approval(gate, geid, "提 PR", {"repo": "a/b", "attempts": gev["attempts"]},
+                               worker_id="w-gate", attempts=gev["attempts"])
+    assert gaid is not None, "主人在跑时应该能插审批"
+    db.decide_approval(gate, gaid, True)
+    grow = gate.execute("SELECT * FROM approvals WHERE id=?", (gaid,)).fetchone()
+    gdet = json.loads(grow["detail"])
+
+    # 门 1：事件还在 running —— 拒绝
+    assert _refusal_reason(gate, grow, gdet) is not None, "事件未结束时不该执行审批"
+
+    # 事件正常结束 + attempt 匹配 —— 放行
+    db.finish_event(gate, geid, "done", "w-gate", gev["attempts"])
+    assert _refusal_reason(gate, grow, gdet) is None, "事件已结束且 attempt 一致，应该放行"
+
+    # 门 2：attempt 不匹配 —— 拒绝
+    assert _refusal_reason(gate, grow, {**gdet, "attempts": gev["attempts"] + 7}) is not None, \
+        "审批属于旧 attempt 时必须拒绝"
+
+    # 门 3：同一事件已有更早的审批执行过 —— 拒绝第二条
+    gaid2 = db.request_approval(gate, geid, "提 PR", {"repo": "a/b", "attempts": gev["attempts"]})
+    assert gaid2 is not None
+    db.decide_approval(gate, gaid2, True)
+    db.mark_executed(gate, gaid)  # 假装第一条已经跑过
+    grow2 = gate.execute("SELECT * FROM approvals WHERE id=?", (gaid2,)).fetchone()
+    assert _refusal_reason(gate, grow2, json.loads(grow2["detail"])) is not None, \
+        "同一事件第二条审批必须拒绝，否则会开第二个 PR"
+    gate.close()
+
     print("worker.py selftest OK: 进→处理→出 / 去重 / 空队列 / 租约心跳 / 失败隔离 / "
-          "被抢后丢弃结果 / 心跳抖动不断线 / --once 回收")
+          "被抢后丢弃结果 / 心跳抖动不断线 / --once 回收 / 审批三道门")
     return 0
 
 
