@@ -231,9 +231,13 @@ def serve(conn, interval: int = POLL_INTERVAL, repo: str | None = None,
         if process_approvals(conn):
             continue  # an approved action just produced deliveries; drain the queue too
         n = run_once(conn)
-        stats = outbox.drain(conn)  # separate step: producing a delivery is not sending it
-        if any(stats.values()):
-            log.info("投递: %s", stats)
+        try:
+            # separate step: producing a delivery is not sending it
+            stats = outbox.drain(conn)
+            if any(stats.values()):
+                log.info("投递: %s", stats)
+        except Exception:  # a lost claim race or a bad row must not kill the worker
+            log.exception("投递出错，下一轮重试")
         if n == 0:
             # Idle is when a dead worker's claim becomes visible: reclaim it and
             # loop again instead of sleeping on it. Recovery needs no restart.
@@ -279,6 +283,7 @@ def _selftest() -> int:
         # An empty queue does nothing.
         assert run_once(conn) == 0
 
+
         # Lease (issue #1): while handle() is busy, the heartbeat thread renews the
         # claim, so a second worker starting up mid-run reclaims nothing.
         seen = {}
@@ -304,6 +309,81 @@ def _selftest() -> int:
         assert seen["requeued"] == 0 and seen["status"] == "running", seen  # not stolen mid-run
         assert conn.execute(
             "SELECT status FROM events WHERE source_id='long-1'").fetchone()["status"] == "done"
+
+        # End-to-end through the resident loop: serve() -> run_once -> outbox.drain
+        # -> a real subprocess that writes the body to a file. The assertions
+        # above only prove a delivery is *produced*; delete the drain call from
+        # serve() and this block is what goes red.
+        # Restore the plain stub: the lease test above replaced handle() with one
+        # that sleeps, and this block patches time.sleep to raise to stop the loop.
+        # `original` is the real handler (it would call Hermes), so rebuild the stub.
+        handle = lambda conn, ev: f"[test] 处理了 {ev['source_id']}"  # noqa: E731
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            (tmp / "rec.py").write_text(
+                "import sys, pathlib\n"
+                "pathlib.Path(sys.argv[1]).write_text(sys.argv[2], encoding='utf-8')\n",
+                encoding="utf-8",
+            )
+            got = (tmp / "got.txt").resolve()
+            e2e = db.connect(tmp / "e2e.db")
+            try:
+                db.enqueue(e2e, "manual", "e2e-1", {"title": "端到端"})
+                saved_cmd = os.environ.get("WICK_SEND_CMD")
+                saved_sleep = time.sleep
+                os.environ["WICK_SEND_CMD"] = (
+                    f'"{sys.executable}" "{(tmp / "rec.py").resolve()}" "{got}"')
+
+                class _OneTick(Exception):
+                    pass
+
+                def _stop_after_tick(_seconds):  # one tick of the resident loop is enough
+                    raise _OneTick
+
+                time.sleep = _stop_after_tick
+                try:
+                    try:
+                        serve(e2e, interval=0)
+                    except _OneTick:
+                        pass
+                finally:
+                    time.sleep = saved_sleep
+                    if saved_cmd is None:
+                        os.environ.pop("WICK_SEND_CMD", None)
+                    else:
+                        os.environ["WICK_SEND_CMD"] = saved_cmd
+
+                assert got.exists(), "serve() 没把投递发出去（outbox.drain 还在 serve 里吗？）"
+                assert got.read_text(encoding="utf-8") == "[test] 处理了 e2e-1", \
+                    got.read_text(encoding="utf-8")
+                row = e2e.execute(
+                    "SELECT status, attempts FROM deliveries ORDER BY id DESC LIMIT 1").fetchone()
+                assert (row["status"], row["attempts"]) == ("sent", 1), dict(row)
+            finally:
+                e2e.close()
+
+        # A failing drain must not take the resident loop down either: this is
+        # how a lost claim race used to kill the worker. The next tick still runs.
+        stats_calls = {"n": 0}
+        real_drain = outbox.drain
+
+        def broken_drain(_conn, **_kw):
+            stats_calls["n"] += 1
+            raise ValueError("模拟投递异常：sent → sent")
+
+        outbox.drain = broken_drain
+        time.sleep = _stop_after_tick
+        try:
+            try:
+                serve(conn, interval=0)  # ValueError must be swallowed inside serve()
+            except _OneTick:
+                pass
+        finally:
+            outbox.drain = real_drain
+            time.sleep = saved_sleep
+        assert stats_calls["n"] >= 1, "serve() 没有调用 outbox.drain"
+
 
         # Failure isolation: a raising handle() marks the event failed, still emits a
         # delivery, and leaves the worker running.
@@ -411,6 +491,7 @@ def _selftest() -> int:
         handle = original
         HEARTBEAT_INTERVAL = original_beat
 
+
     # process_approvals 的三道门。缺任何一道，一个失去租约的尝试都能留下一份
     # 能被批准、并且真的会去开 PR 的审批。
     gate = db.connect(":memory:")
@@ -445,7 +526,9 @@ def _selftest() -> int:
     gate.close()
 
     print("worker.py selftest OK: 进→处理→出 / 去重 / 空队列 / 租约心跳 / 失败隔离 / "
-          "被抢后丢弃结果 / 心跳抖动不断线 / --once 回收 / 审批三道门")
+          "被抢后丢弃结果 / 心跳抖动不断线 / --once 回收 / 审批三道门 / 常驻循环真发出投递")
+
+
     return 0
 
 
