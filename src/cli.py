@@ -114,14 +114,23 @@ def _selftest() -> int:
     import tempfile
     from contextlib import redirect_stdout
 
-    with tempfile.TemporaryDirectory() as td:
+    # ignore_cleanup_errors: on Windows the sqlite WAL/SHM files of a just-closed
+    # connection can still be held for a moment, which made cleanup raise after
+    # every assertion had already passed.
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
         path = Path(td) / "wick.db"
         conn = db.connect(path)
         eid, _ = db.enqueue(conn, "github_issue", "cmyyy/wick#1", {"title": "outbox 节流算错"})
-        db.finish_event(conn, eid, "done")
-        db.add_delivery(conn, eid, "已处理")
+        # #10 fenced every write a lease owns: claim first, and ask for the approval
+        # while the event is still running (the fence refuses a finished event).
+        claimed = db.claim_next(conn, "cli-selftest")
+        assert claimed is not None and claimed["id"] == eid
         aid = db.request_approval(conn, eid, "提 PR",
-                                  {"repo": "cmyyy/wick", "number": 1, "title": "outbox 节流算错"})
+                                  {"repo": "cmyyy/wick", "number": 1, "title": "outbox 节流算错"},
+                                  worker_id="cli-selftest", attempts=claimed["attempts"])
+        assert aid is not None, "running 状态下应该能插审批"
+        db.finish_event(conn, eid, "done", "cli-selftest", claimed["attempts"])
+        db.add_delivery(conn, eid, "已处理")
         conn.close()
 
         def run(fn, **kw) -> tuple[int, str]:
