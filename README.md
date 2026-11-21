@@ -102,6 +102,7 @@ wick/
 ├── src/
 │   ├── db.py          三张表 schema + 去重
 │   ├── worker.py      inbox 消费者（独立进程）
+│   ├── outbox.py      投递队列（日上限节流 / 指数退避重投 / 真实发消息）
 │   ├── sources/       事件源（github.py = since 增量轮询）
 │   └── prompts/       起 run 用的提示词
 ├── desktop/
@@ -116,12 +117,38 @@ wick/
 
 ---
 
+## 投递队列（outbox）
+
+事件处理的结果先写进 `deliveries`（`queued`），再由 outbox 真正发出去。**产生投递和发送是两步**：常驻 worker 每轮循环末尾自动 drain 一次，也可以手动发一轮：
+
+```
+python src/outbox.py --drain   # 发一轮，打印 {"sent":n,"throttled":n,"failed":n,"retrying":n}
+python src/outbox.py           # 自检
+```
+
+状态机：`queued → sent`（送达，计入当日额度）、`queued → throttled`（超额，压到次日 0 点后自动回到 `queued`）、`queued → queued`（失败，退避后重试）、`→ failed`（重试用尽，终态不再发）。
+
+并发安全：发送前先用一条 `UPDATE ... WHERE status='queued' AND next_attempt_at <= <now> RETURNING *` **原子占位**，占位后的行 10 分钟内对其他 drain 不可见。所以常驻 worker 和手动 `--drain` 同时跑不会重复发送；万一 drain 发到一半崩了，租约到期后这行会自己回来重发。
+
+| 环境变量 | 默认 | 作用 |
+|---|---|---|
+| `WICK_DAILY_LIMIT` | `20` | 每个本地自然日最多发几条，超出的压到次日 0 点 |
+| `WICK_MAX_ATTEMPTS` | `4` | 一条投递尝试几次后判 `failed`（终态） |
+| `WICK_BACKOFF_BASE` | `60` | 指数退避起始秒数：60、120、240…，单次等待上限 1 小时 |
+| `WICK_SEND_CMD` | `hermes send -t {channel}` | 换掉整条发送命令；`{channel}` 由投递行决定，消息正文作为最后一个参数追加 |
+
+单次发送超时固定 120 秒（`src/outbox.py` 里的 `SEND_TIMEOUT`，不读环境变量）。
+
+`WICK_SEND_CMD` 按命令行规则切分：Windows 上反斜杠原样保留，`C:\Tools\send.cmd` 可以直接写；路径含空格要加引号，例如 `WICK_SEND_CMD="C:\Program Files\send.cmd" -t feishu`。正斜杠两边都能用。
+
+---
+
 ## 代码约定
 
 - **注释和 docstring 一律英文**，包括行内注释和模块说明。代码是给所有读者看的，中文注释会把非中文读者挡在外面。
 - **面向用户的字符串保持中文**：投递内容、错误提示、CLI `--help`、日志消息。这些是产品文案，不是代码注释。
 - **一个 inbox 只允许一个活跃 worker**（见 `DECISIONS.md` #5）。要并行就按 `source_type` 分片，不要在 worker 里加线程。
-- **每个非平凡模块留一个 `--selftest`**，用 `assert` 断言，不引入测试框架。跑法：`python src/db.py`、`python src/worker.py --selftest`、`python src/sources/github.py`、`python eval/run.py --selftest`。
+- **每个非平凡模块留一个 `--selftest`**，用 `assert` 断言，不引入测试框架。九个自检：`python src/db.py`、`python src/worker.py --selftest`、`python src/sources/github.py`、`python src/agent.py`、`python src/sandbox.py`、`python src/actions.py`、`python src/cli.py selftest`、`python src/outbox.py`、`python eval/run.py --selftest`。
 
 ## 状态
 
