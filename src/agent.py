@@ -191,7 +191,8 @@ def handle_issue_fix(conn, event) -> str:
 
     payload = json.loads(event["payload"] or "{}")
     number = payload.get("number", "?")
-    worktree, branch = sandbox.create(PROJECT_ROOT, event["id"], number)
+    worktree, branch = sandbox.create(PROJECT_ROOT, event["id"], number,
+                                      attempt=event["attempts"])
 
     run_error: Exception | None = None
     text = ""
@@ -222,7 +223,11 @@ def handle_issue_fix(conn, event) -> str:
         "worktree": str(worktree),
         "files": changes["files"],
         "diff": f"+{changes['lines_added']}/-{changes['lines_removed']}",
-    })
+    }, worker_id=event["worker_id"], attempts=event["attempts"])
+    if approval_id is None:
+        # The lease was reclaimed while we worked: some other attempt owns the
+        # event now. Queue nothing -- the worker drops the whole result.
+        raise RuntimeError("事件已被回收并转交，本次结果作废（不写审批、不投递）")
     return compose_fix_report(payload, text, None, checks, changes, worktree, branch,
                               approval_id=approval_id)
 
