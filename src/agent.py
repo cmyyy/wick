@@ -8,6 +8,10 @@ Two modes, chosen by the event source:
   running the project's own self-checks. The verification is run by THIS module,
   never taken from the agent's own writeup: a self-report is not evidence.
 
+Both paths carry cross-run memory (D7): the prompt gets `progress.load(task)` up
+front and the run's outcome is appended when it ends, so a second round on the
+same task continues instead of re-analysing from zero.
+
 ponytail: one subprocess per event, no pooling. Fine at a few events per hour;
 if throughput ever matters, this is where a resident gateway client would go.
 """
@@ -15,6 +19,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -35,6 +40,7 @@ CHECKS = [
     ["src/agent.py"],
     ["src/sandbox.py"],
     ["src/actions.py"],
+    ["src/progress.py"],
     ["src/cli.py", "selftest"],
     ["src/outbox.py"],
     ["eval/run.py", "--selftest"],
@@ -42,11 +48,14 @@ CHECKS = [
 
 VERDICTS_FIX = ("已修复", "部分修复", "无法修复")
 VERDICTS_ANALYZE = ("可处理", "需补充信息", "不处理")
+# Injected when the task has no history: the prompt must still render, and the
+# agent should know a first run is a first run.
+NO_PROGRESS = "（没有历史进度：这是这个任务的第一次运行）"
 # The only irreversible action this version asks permission for.
 _ACTION_LABEL = "提 PR"
 
 
-def _render(template: str, payload: dict, **extra) -> str:
+def _render(template: str, payload: dict, progress: str = "", **extra) -> str:
     tpl = (PROMPT_DIR / template).read_text(encoding="utf-8")
     labels = ", ".join(payload.get("labels") or []) or "(无)"
     return tpl.format(
@@ -58,18 +67,20 @@ def _render(template: str, payload: dict, **extra) -> str:
         author=payload.get("author") or "(未知)",
         state=payload.get("state") or "(未知)",
         body=payload.get("body") or "(正文为空)",
+        progress=progress or NO_PROGRESS,
         **extra,
     )
 
 
-def render_issue_prompt(payload: dict) -> str:
+def render_issue_prompt(payload: dict, progress: str = "") -> str:
     """Read-only analysis prompt (D3)."""
-    return _render("issue.md", payload)
+    return _render("issue.md", payload, progress)
 
 
-def render_fix_prompt(payload: dict, worktree: Path, branch: str) -> str:
+def render_fix_prompt(payload: dict, worktree: Path, branch: str,
+                      progress: str = "") -> str:
     """Fix prompt pointing the agent at its own worktree (D4)."""
-    return _render("issue_fix.md", payload, worktree=str(worktree), branch=branch)
+    return _render("issue_fix.md", payload, progress, worktree=str(worktree), branch=branch)
 
 
 def run_prompt(prompt: str, cwd: str | Path | None = None,
@@ -117,6 +128,19 @@ def verdict_of(text: str, kind: str = "analyze") -> str | None:
                 if v in line:
                     return v
     return None
+
+
+def leftover_of(text: str) -> str:
+    """The 遗留 line from a report, or 无 when the agent named nothing.
+
+    Progress must record what is still open -- that is the one part of the
+    writeup the next run cannot reconstruct by itself.
+    """
+    for line in text.splitlines():
+        m = re.match(r"\s*[-*#>\s]*遗留(?:问题)?\s*[:：]\s*(.+)", line)
+        if m:
+            return m.group(1).strip().strip("`*") or "无"
+    return "无"
 
 
 def run_checks(worktree: Path, timeout: int = CHECK_TIMEOUT) -> dict:
@@ -177,8 +201,17 @@ def compose_fix_report(payload: dict, text: str, run_error: Exception | None,
 
 def handle_event(event) -> str:
     """D3 path: read-only analysis, no worktree, no file changes."""
+    import progress as progressmod
+
     payload = json.loads(event["payload"] or "{}")
-    return run_prompt(render_issue_prompt(payload))
+    task = progressmod.task_id(event)
+    learned = progressmod.load(task)
+    text = run_prompt(render_issue_prompt(payload, learned))
+    # An analysis leaves no diff but does leave a decision. Recording it is what
+    # stops the next round from asking the same question again.
+    progressmod.append(task, verdict=verdict_of(text),
+                       checks="—（只读分析，未改代码）", leftover=leftover_of(text))
+    return text
 
 
 def handle_issue_fix(conn, event) -> str:
@@ -192,23 +225,36 @@ def handle_issue_fix(conn, event) -> str:
     run is recorded as failed even if the agent claims otherwise.
     """
     import db as dbmod
+    import progress as progressmod
     import sandbox
 
     payload = json.loads(event["payload"] or "{}")
     number = payload.get("number", "?")
+    task = progressmod.task_id(event)
     worktree, branch = sandbox.create(PROJECT_ROOT, event["id"], number,
                                       attempt=event["attempts"])
 
     run_error: Exception | None = None
     text = ""
     try:
-        text = run_prompt(render_fix_prompt(payload, worktree, branch),
+        text = run_prompt(render_fix_prompt(payload, worktree, branch,
+                                            progressmod.load(task)),
                           cwd=worktree, timeout=FIX_TIMEOUT)
     except Exception as exc:  # still collect the diff before failing
         run_error = exc
 
     checks = run_checks(worktree)
     changes = sandbox.diff(PROJECT_ROOT, worktree)
+
+    # Write the trace before the raises below: a failed or half-done run is
+    # exactly what the next round has to know about. The worktree is thrown
+    # away, this file is not.
+    leftover = leftover_of(text)
+    if run_error is not None:
+        leftover = f"上次运行失败（{run_error}）；{leftover}"
+    progressmod.append(task, verdict=verdict_of(text, "fix") if text else None,
+                       files=changes["files"], checks=_checks_line(checks),
+                       leftover=leftover)
 
     if run_error is not None:
         raise RuntimeError(
@@ -251,6 +297,10 @@ def handle_issue_fix(conn, event) -> str:
 
 def _selftest() -> int:
     """Self-check: template rendering, verdict parsing, check runner. No model call."""
+    import progress as progressmod
+
+    global run_prompt
+
     payload = {
         "repo": "cmyyy/wick", "number": 7, "title": "outbox 节流算错",
         "url": "https://github.com/cmyyy/wick/issues/7",
@@ -263,6 +313,7 @@ def _selftest() -> int:
     assert "cmyyy/wick" in prompt and "#7" in prompt, prompt[:200]
     assert "outbox 节流算错" in prompt and "bug, reliability" in prompt
     assert "日上限算成了 0 条" in prompt
+    assert NO_PROGRESS in prompt, "第一次运行也要渲染出进度段落"
 
     # Fix template carries the worktree contract.
     wt_path = Path("/tmp/wt-x")
@@ -270,6 +321,17 @@ def _selftest() -> int:
     assert str(wt_path) in fix and "wick/issue-7-run-3" in fix
     for must in ("git commit", "git push", "python src/db.py", "判定：<已修复"):
         assert must in fix, must
+
+    # Cross-run memory reaches the model, in both templates. Without this the
+    # whole module is dead weight: it would write files nobody reads.
+    memory = "### 本任务（issue-7）的历史进度，从旧到新\n## 2026-11-22T12:00:00\n- 判定：部分修复"
+    for rendered in (render_issue_prompt(payload, memory),
+                     render_fix_prompt(payload, wt_path, "b", memory)):
+        assert "- 判定：部分修复" in rendered and "2026-11-22T12:00:00" in rendered, rendered
+        assert NO_PROGRESS not in rendered, "有进度时不该说这是第一次运行"
+
+    # The check list must actually run the new module (else it rots unseen).
+    assert ["src/progress.py"] in CHECKS, CHECKS
 
     # Missing optional fields must not raise.
     minimal = render_issue_prompt({"repo": "a/b", "number": 1})
@@ -285,6 +347,54 @@ def _selftest() -> int:
     assert verdict_of("判定：部分修复", "fix") == "部分修复"
     assert verdict_of("判定：可处理", "fix") is None  # analysis verdict is not a fix verdict
 
+    # 遗留 parsing: what the next run reads to know what is still open.
+    assert leftover_of("判定：已修复\n遗留问题：无") == "无"
+    assert leftover_of("**遗留：eval 用例还没补**") == "eval 用例还没补"
+    assert leftover_of("- 遗留问题:`补 eval`") == "补 eval"
+    assert leftover_of("没按格式写") == "无"
+
+    # Two rounds on one task, no model involved: round 2 must SEE round 1. If the
+    # append or the load wiring breaks, this is the assertion that goes red.
+    import tempfile
+    event = {"id": 41, "source_type": "github_issue",
+             "payload": json.dumps({"repo": "cmyyy/wick", "number": 4, "title": "跨 run 记忆"})}
+    with tempfile.TemporaryDirectory() as td:
+        saved_dir, saved_run = progressmod.PROGRESS_DIR, run_prompt
+        prompts: list[str] = []
+        progressmod.PROGRESS_DIR = Path(td) / "progress"
+
+        def fake_run(prompt, cwd=None, timeout=DEFAULT_TIMEOUT):
+            prompts.append(prompt)
+            return "判定：需补充信息\n\n需要作者补充复现步骤"
+
+        run_prompt = fake_run
+        try:
+            handle_event(event)                                    # round 1
+            assert "### 本任务" not in prompts[0], "第一轮不该有历史"
+            assert NO_PROGRESS in prompts[0]
+            handle_event(event)                                    # round 2, same task
+            assert "- 判定：需补充信息" in prompts[1], "第二轮看不到第一轮判定了什么"
+            assert "issue-4: need-info" in prompts[1], "索引没带上"
+
+            # The fix path reads the same memory: files and check results must
+            # show up in its prompt, not just the verdict.
+            progressmod.append("issue-4", verdict="部分修复", files=["src/progress.py"],
+                               checks="10/10 通过", leftover="eval 用例还没补")
+            fix_prompt = render_fix_prompt(payload, Path("/tmp/wt-x"), "b",
+                                           progressmod.load("issue-4"))
+            for must in ("src/progress.py", "10/10 通过", "eval 用例还没补", "部分修复"):
+                assert must in fix_prompt, (must, fix_prompt[:400])
+
+            # Same event id, different issue number = a different task, and it
+            # still gets the index line of the first one.
+            other = {**event, "payload": json.dumps({"number": 99})}
+            handle_event(other)
+            assert "issue-4: partial" in prompts[2], "索引应该对所有任务可见"
+            assert "# issue-99" not in prompts[2] and "eval 用例还没补" not in prompts[2], \
+                "别的任务的正文不该进来"
+        finally:
+            run_prompt, progressmod.PROGRESS_DIR = saved_run, saved_dir
+
     # The check runner must actually detect a broken worktree.
     import tempfile
     with tempfile.TemporaryDirectory() as td:
@@ -293,8 +403,8 @@ def _selftest() -> int:
         (wt / "eval").mkdir()
         good = "print('ok')\n"
         for rel in ("src/db.py", "src/worker.py", "src/sources/github.py", "src/agent.py",
-                    "src/sandbox.py", "src/actions.py", "src/cli.py", "src/outbox.py",
-                    "eval/run.py"):
+                    "src/sandbox.py", "src/actions.py", "src/progress.py", "src/cli.py",
+                    "src/outbox.py", "eval/run.py"):
             (wt / rel).parent.mkdir(parents=True, exist_ok=True)
             (wt / rel).write_text(good, encoding="utf-8")
         checks = run_checks(wt)
@@ -306,7 +416,7 @@ def _selftest() -> int:
         assert not checks["all_ok"] and checks["passed"] == total - 1, checks
         assert "src/db.py" in _checks_line(checks)
 
-    print("agent.py selftest OK: 模板渲染 / 判定解析 / 自检真能失败")
+    print("agent.py selftest OK: 模板渲染 / 判定解析 / 自检真能失败 / 两轮跑同一个任务第二轮看得到第一轮")
     return 0
 
 
