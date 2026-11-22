@@ -1,7 +1,7 @@
 """wick CLI: the human side of approvals and retries.
 
-D8 replaces the approve step with a desktop panel; until then this is the only
-way to say yes. Deliberately tiny: list, approve, reject, retry, status.
+The D8 page (`python src/cli.py panel`) is the pretty path; this CLI is the
+scriptable one (and the only one that works over SSH). Commands:
 
 Usage:
     python src/cli.py status
@@ -10,6 +10,7 @@ Usage:
     python src/cli.py reject <id>
     python src/cli.py retry <event_id>
     python src/cli.py schedule <ISO 时间> <做什么>
+    python src/cli.py panel [--port 9119]
 """
 from __future__ import annotations
 
@@ -162,6 +163,12 @@ def cmd_schedule(args) -> int:
         conn.close()
 
 
+def cmd_panel(args) -> int:
+    """Serve the D8 page (src/server.py). Blocks until Ctrl+C."""
+    import server
+    return server.serve(args.port, args.db or db.DEFAULT_DB)
+
+
 # ---------------------------------------------------------------- selftest
 
 def _selftest() -> int:
@@ -267,6 +274,9 @@ def main() -> int:
     p.add_argument("when", help="ISO 时间，如 2026-11-23T09:00:00+08:00（不带偏移按本机时区）")
     p.add_argument("what", help="到时候做什么")
     p.set_defaults(func=cmd_schedule)
+    p = sub.add_parser("panel", help="起本地面板（D8）")
+    p.add_argument("--port", type=int, default=9119, help="监听端口（0 = 让 OS 分配）")
+    p.set_defaults(func=cmd_panel)
 
     args = ap.parse_args()
     return args.func(args)
