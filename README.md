@@ -30,9 +30,9 @@ GitHub 上已经有 5 个同赛道项目（都叫 nightshift），它们解决�
 | | 是什么 |
 |---|---|
 | **wick（这个仓库）** | 一个常驻 agent：事件进 `events` 表，worker 消费，结果进 `deliveries`，不可逆动作停下等人批准 |
-| **wick 的开发过程** | 人工编排 + 多个 bot 分工（一个 orchestrator 拆任务、两个 implementer 写代码、一个 reviewer 审查），人在环上拍板 |
+| **wick 的开发过程** | 人工编排 + 三个 bot 分工：orchestrator（拆任务）、implementer（写代码）、reviewer（审 PR），人在环上拍板 |
 
-**这两件事现在还没接上。** 开发 wick 时派活是直接起子进程，结果走 stdout，不经过本仓库的 `events` / `deliveries`。
+**这两件事现在还没接上。** 开发 wick 时派活走固定的 `Bot Chat` 会话（Hermes 原生 bot mode），结果从该会话取，不经过本仓库的 `events` / `deliveries`。
 
 所以下面这些说法是**错的**，不要用：
 
@@ -42,6 +42,15 @@ GitHub 上已经有 5 个同赛道项目（都叫 nightshift），它们解决�
 正确的是：
 
 - ✅ "wick 是产品形态；当前开发流程是人工编排 + bot 分工"
+
+**术语警告**：`worker` 这个词在两个语境里指不同东西，读文档时别串：
+
+| 写在哪 | 指什么 | 特征 |
+|---|---|---|
+| `src/worker.py`、架构图、可靠性验收 | **产品的 worker** | 常驻进程，消费 `events` 表，有租约/心跳/attempt fence |
+| 「派活」「implementer」 | **开发时的 bot** | `developer`，人是它的调度器，经由固定 `Bot Chat` 会话 |
+
+两者共用的只有"处理一件事"这个语义。产品的 worker 是代码，开发的 bot 是人手里的工具，**现在还没有任何一行代码把它们连起来**——那正是下面说的 D9 之后要做的事。
 
 **什么时候接上**：D9 可靠性验收通过之后（重复投递 0、崩溃恢复可用），再把派活改成写 `events` 表、结果进 `deliveries`。在那之前拿半成品当开发工具，等于在沼泽地上盖房子。
 
@@ -56,8 +65,8 @@ GitHub 上已经有 5 个同赛道项目（都叫 nightshift），它们解决�
 | 原语 | 作用 | wick 的实现 |
 |---|---|---|
 | **事件收件箱** | 所有触发统一进入口 | `events` 表 + 唯一索引去重 + 单 worker 串行消费 |
-| **定时器** | 到点叫醒 | 定时器只**产生事件**，不直接执行 |
-| **记忆** | 跨 run 的连续性 | `progress/<task>.md` 进度文件（注入最近几轮）+ 一行索引（只列在途任务）；恢复点是上一轮**已完成**的记录 |
+| **定时器** | 到点叫醒 | `events.due_at`（ISO 时间）；`claim_next` 只领 `due_at IS NULL OR due_at <= now` 的行。**只产生事件，不直接执行** |
+| **记忆** | 跨 run 的连续性 | `~/.wick/progress/<task>.md` + `index.md`（**在仓库之外**，见决策 14）；注入最近几轮 + 一行索引（只列在途任务）；恢复点是上一轮**已完成**的记录 |
 | **权限** | 无人值守的风险边界 | `approvals` 表：不可逆动作 → run 结束 → 等你批准 → 起新 run |
 | **投递队列** | 结果怎么到你手上 | `deliveries` 表 + 节流 + 失败重投 |
 
@@ -75,7 +84,7 @@ GitHub 上已经有 5 个同赛道项目（都叫 nightshift），它们解决�
                           ▼
                    ┌──────────────┐
                    │    worker    │  独立进程，开机自启
-                   │  (独立进程)  │  调 gateway RPC 起一次 run
+                   │  (独立进程)  │  起一次 run = `hermes -z` 子进程
                    └──────┬───────┘
                           │
           ┌───────────────┼───────────────┐
@@ -126,9 +135,13 @@ wick/
 ├── DECISIONS.md       13 条关键决策 + 理由（防止后面改主意）
 ├── ROADMAP.md         10 个工作日排期
 ├── src/
-│   ├── db.py          三张表 schema + 去重
-│   ├── worker.py      inbox 消费者（独立进程）
+│   ├── db.py          三张表 schema + 去重 + due_at 定时
+│   ├── worker.py      inbox 消费者（独立进程）+ 租约 + 看门狗
+│   ├── agent.py       一次 run：起 hermes 子进程、判定、写审批
+│   ├── sandbox.py     一次性 worktree 的创建与 diff
+│   ├── actions.py     审批通过后的真实动作（commit / push / 提 PR）
 │   ├── outbox.py      投递队列（日上限节流 / 指数退避重投 / 真实发消息）
+│   ├── cli.py         status / approvals / approve / reject / retry / schedule
 │   ├── sources/       事件源（github.py = since 增量轮询）
 │   └── prompts/       起 run 用的提示词
 ├── desktop/
