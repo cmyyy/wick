@@ -48,7 +48,7 @@ GitHub 上已经有 5 个同赛道项目（都叫 nightshift），它们解决�
 | 写在哪 | 指什么 | 特征 |
 |---|---|---|
 | `src/worker.py`、架构图、可靠性验收 | **产品的 worker** | 常驻进程，消费 `events` 表，有租约/心跳/attempt fence |
-| 「派活」「implementer」 | **开发时的 bot** | `wick-dev-1`，人是它的调度器，经由固定 `Bot Chat` 会话 |
+| 「派活」「implementer」 | **开发时的 bot** | `developer`，人是它的调度器，经由固定 `Bot Chat` 会话 |
 
 两者共用的只有"处理一件事"这个语义。产品的 worker 是代码，开发的 bot 是人手里的工具，**现在还没有任何一行代码把它们连起来**——那正是下面说的 D9 之后要做的事。
 
