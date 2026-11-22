@@ -1,13 +1,14 @@
-"""wick CLI: the human side of approvals.
+"""wick CLI: the human side of approvals and retries.
 
 D8 replaces the approve step with a desktop panel; until then this is the only
-way to say yes. Deliberately tiny: list, approve, reject, status.
+way to say yes. Deliberately tiny: list, approve, reject, retry, status.
 
 Usage:
     python src/cli.py status
     python src/cli.py approvals [--all]
     python src/cli.py approve <id>
     python src/cli.py reject <id>
+    python src/cli.py retry <event_id>
 """
 from __future__ import annotations
 
@@ -106,6 +107,45 @@ def cmd_reject(args) -> int:
     return _decide(args, False)
 
 
+def cmd_retry(args) -> int:
+    """Put a finished event back in the queue. The only retry the system has.
+
+    done/failed are terminal: claim_next only ever picks `pending`, and dedupe
+    means the same issue will not be enqueued twice. Without this command a
+    second run on a task is impossible by hand as well as by machine, so the
+    progress file a run writes could never be read by a later run.
+
+    attempts is kept: it is the attempt counter, not a retry counter, and the
+    next claim makes it N+1 -- which is also what keeps the old attempt's late
+    writes fenced off.
+    """
+    conn = connect(args)
+    try:
+        row = conn.execute("SELECT id, status, attempts FROM events WHERE id=?",
+                           (args.id,)).fetchone()
+        if row is None:
+            print(f"事件 #{args.id} 不存在", file=sys.stderr)
+            return 1
+        if row["status"] not in ("done", "failed"):
+            print(f"事件 #{args.id} 当前是 {row['status']}，只有 done/failed 能 retry",
+                  file=sys.stderr)
+            return 1
+        cur = conn.execute(
+            "UPDATE events SET status='pending', worker_id=NULL, heartbeat_at=NULL, "
+            "updated_at=? WHERE id=? AND status IN ('done','failed')",
+            (db.now(), args.id),
+        )
+        conn.commit()
+        if cur.rowcount != 1:
+            print(f"事件 #{args.id} 状态刚刚变了，没有重排", file=sys.stderr)
+            return 1
+        print(f"已重排事件 #{args.id}（attempts={row['attempts']} 保留，"
+              f"下次领取是 attempt {row['attempts'] + 1}）")
+        return 0
+    finally:
+        conn.close()
+
+
 # ---------------------------------------------------------------- selftest
 
 def _selftest() -> int:
@@ -121,6 +161,7 @@ def _selftest() -> int:
         path = Path(td) / "wick.db"
         conn = db.connect(path)
         eid, _ = db.enqueue(conn, "github_issue", "cmyyy/wick#1", {"title": "outbox 节流算错"})
+        assert eid is not None
         # #10 fenced every write a lease owns: claim first, and ask for the approval
         # while the event is still running (the fence refuses a finished event).
         claimed = db.claim_next(conn, "cli-selftest")
@@ -165,7 +206,24 @@ def _selftest() -> int:
         finally:
             db.DEFAULT_DB = original_default
 
-    print("cli.py selftest OK: 状态计数 / 待批准列表 / 批准一次且只一次 / 缺省 --db 回退")
+        # P0-1: retry is the only path that gives a task a second run (done and
+        # failed are terminal, and dedupe keeps the issue from being enqueued
+        # again). done -> pending, attempts kept, and claim_next must take it.
+        rc, out = run(cmd_retry, id=eid)
+        assert rc == 0 and "已重排" in out, out
+        conn = db.connect(path)
+        again = db.claim_next(conn, "cli-selftest-2")
+        assert again is not None and again["id"] == eid, dict(again or {})
+        assert again["attempts"] == claimed["attempts"] + 1, dict(again)
+        conn.close()
+        # Only a finished event can be retried; a claimed (running) one cannot.
+        rc, out = run(cmd_retry, id=eid)
+        assert rc == 1, ("running 事件不该被 retry", out)
+        rc, out = run(cmd_retry, id=eid + 99)
+        assert rc == 1, out
+
+    print("cli.py selftest OK: 状态计数 / 待批准列表 / 批准一次且只一次 / 缺省 --db 回退 / "
+          "retry 把 done 事件放回 pending 且保留 attempts")
     return 0
 
 
@@ -185,6 +243,10 @@ def main() -> int:
         p = sub.add_parser(name, help=desc)
         p.add_argument("id", type=int)
         p.set_defaults(func=fn)
+
+    p = sub.add_parser("retry", help="把 done/failed 事件重新排回 pending（保留 attempts）")
+    p.add_argument("id", type=int, help="事件 id（src/cli.py status 里能看到）")
+    p.set_defaults(func=cmd_retry)
 
     args = ap.parse_args()
     return args.func(args)

@@ -53,7 +53,7 @@ def handle(conn, event) -> str:
     if event["source_type"] == "github_issue":
         import agent  # local import: keeps --selftest free of model deps
         if FIX_MODE == "analyze":
-            return agent.handle_event(event)
+            return agent.handle_event(conn, event)
         return agent.handle_issue_fix(conn, event)
 
     payload = json.loads(event["payload"] or "{}")

@@ -57,7 +57,7 @@ GitHub 上已经有 5 个同赛道项目（都叫 nightshift），它们解决�
 |---|---|---|
 | **事件收件箱** | 所有触发统一进入口 | `events` 表 + 唯一索引去重 + 单 worker 串行消费 |
 | **定时器** | 到点叫醒 | 定时器只**产生事件**，不直接执行 |
-| **记忆** | 跨 run 的连续性 | `progress/<task>.md` 进度文件 + 索引按需加载 |
+| **记忆** | 跨 run 的连续性 | `progress/<task>.md` 进度文件（注入最近几轮）+ 一行索引（只列在途任务）；恢复点是上一轮**已完成**的记录 |
 | **权限** | 无人值守的风险边界 | `approvals` 表：不可逆动作 → run 结束 → 等你批准 → 起新 run |
 | **投递队列** | 结果怎么到你手上 | `deliveries` 表 + 节流 + 失败重投 |
 
@@ -179,7 +179,7 @@ python src/outbox.py           # 自检
 - **注释和 docstring 一律英文**，包括行内注释和模块说明。代码是给所有读者看的，中文注释会把非中文读者挡在外面。
 - **面向用户的字符串保持中文**：投递内容、错误提示、CLI `--help`、日志消息。这些是产品文案，不是代码注释。
 - **一个 inbox 只允许一个活跃 worker**（见 `DECISIONS.md` #5）。要并行就按 `source_type` 分片，不要在 worker 里加线程。
-- **每个非平凡模块留一个 `--selftest`**，用 `assert` 断言，不引入测试框架。九个自检：`python src/db.py`、`python src/worker.py --selftest`、`python src/sources/github.py`、`python src/agent.py`、`python src/sandbox.py`、`python src/actions.py`、`python src/cli.py selftest`、`python src/outbox.py`、`python eval/run.py --selftest`。
+- **每个非平凡模块留一个 `--selftest`**，用 `assert` 断言，不引入测试框架。十个自检：`python src/db.py`、`python src/worker.py --selftest`、`python src/sources/github.py`、`python src/agent.py`、`python src/sandbox.py`、`python src/actions.py`、`python src/progress.py`、`python src/cli.py selftest`、`python src/outbox.py`、`python eval/run.py --selftest`。
 
 ## 状态
 

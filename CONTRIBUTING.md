@@ -58,12 +58,13 @@ python src/sources/github.py
 python src/agent.py
 python src/sandbox.py
 python src/actions.py
+python src/progress.py
 python src/cli.py selftest
 python src/outbox.py
 python eval/run.py --selftest
 ```
 
-九个全绿再提。新增模块时把它的自检加进这份清单，`src/agent.py` 里的 `CHECKS` 也要同步——那是 worker 跑 agent 改动后实际执行的门槛，不同步等于新模块坏了没人管。
+十个全绿再提。新增模块时把它的自检加进这份清单，`src/agent.py` 里的 `CHECKS` 也要同步——那是 worker 跑 agent 改动后实际执行的门槛，不同步等于新模块坏了没人管。
 
 ## PR 要求
 
