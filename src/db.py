@@ -45,6 +45,11 @@ CREATE TABLE IF NOT EXISTS events (
     source_type TEXT NOT NULL,
     source_id   TEXT NOT NULL,
     payload     TEXT NOT NULL DEFAULT '{}',
+    -- When this event becomes claimable. NULL = due immediately. Stored in
+    -- exactly now()'s layout (UTC, second precision, +00:00 offset), so the
+    -- TEXT comparison in claim_next is also a chronological comparison; a
+    -- second layout with another offset would silently reorder the queue.
+    due_at      TEXT,
     status      TEXT NOT NULL DEFAULT 'pending',
     worker_id   TEXT,
     heartbeat_at TEXT,
@@ -125,8 +130,11 @@ def _migrate(conn: sqlite3.Connection) -> None:
 
     # Lease columns (issue #1). Rows claimed before this upgrade have no
     # heartbeat_at and are treated as stale on the next requeue_stale().
+    # due_at (issue #14): a NULL means "due now", so rows queued before the
+    # upgrade keep their old behaviour exactly. ALTER TABLE, never a rebuild:
+    # the table holds real events.
     ecols = {r["name"] for r in conn.execute("PRAGMA table_info(events)")}
-    for col in ("worker_id", "heartbeat_at"):
+    for col in ("worker_id", "heartbeat_at", "due_at"):
         if col not in ecols:
             conn.execute(f"ALTER TABLE events ADD COLUMN {col} TEXT")
 
@@ -136,8 +144,13 @@ def _migrate(conn: sqlite3.Connection) -> None:
 # ------------------------------------------------------------------ events
 
 def enqueue(conn: sqlite3.Connection, source_type: str, source_id: str,
-            payload: dict[str, Any] | None = None) -> tuple[int | None, bool]:
+            payload: dict[str, Any] | None = None, *,
+            due_at: str | None = None) -> tuple[int | None, bool]:
     """Enqueue one event. Returns (event_id, created).
+
+    due_at is when the event becomes claimable (NULL = immediately, the old
+    behaviour). Callers with a time in hand should go through
+    schedule_followup(), which normalizes and validates it.
 
     Duplicates return (existing_id, False) instead of raising: the caller is a
     poller and should not need retry logic just because it saw an item twice.
@@ -145,9 +158,11 @@ def enqueue(conn: sqlite3.Connection, source_type: str, source_id: str,
     key = dedupe_key(source_type, source_id)
     ts = now()
     cur = conn.execute(
-        "INSERT OR IGNORE INTO events (dedupe_key, source_type, source_id, payload, created_at, updated_at) "
-        "VALUES (?,?,?,?,?,?)",
-        (key, source_type, source_id, json.dumps(payload or {}, ensure_ascii=False), ts, ts),
+        "INSERT OR IGNORE INTO events "
+        "(dedupe_key, source_type, source_id, payload, due_at, created_at, updated_at) "
+        "VALUES (?,?,?,?,?,?,?)",
+        (key, source_type, source_id, json.dumps(payload or {}, ensure_ascii=False),
+         due_at, ts, ts),
     )
     conn.commit()
     if cur.rowcount == 1:
@@ -156,20 +171,61 @@ def enqueue(conn: sqlite3.Connection, source_type: str, source_id: str,
     return (row["id"] if row else None), False
 
 
+def parse_due_at(when: str) -> str:
+    """Normalize an ISO time to now()'s exact layout. ValueError when unparseable.
+
+    claim_next compares due_at to now() as TEXT, so both sides must share one
+    fixed layout: with a constant width and offset, lexicographic order is
+    chronological order. A naive input is read as local time (the ticket asks
+    for no timezone handling beyond that) and converted to UTC here; a time
+    carrying an offset is converted too, so "+08:00" and "Z" spellings of the
+    same instant dedupe to one row instead of two.
+    """
+    dt = datetime.fromisoformat(when.strip())
+    if dt.tzinfo is None:
+        dt = dt.astimezone()  # naive = local wall clock
+    return dt.astimezone(timezone.utc).isoformat(timespec="seconds")
+
+
+def followup_source_id(due_at: str, note: str) -> str:
+    """`<due_at>:<sha256(note)[:16]>` — one event per (time, task) pair."""
+    return f"{due_at}:{hashlib.sha256(note.encode()).hexdigest()[:16]}"
+
+
+def schedule_followup(conn: sqlite3.Connection, when: str,
+                      note: str) -> tuple[int | None, bool]:
+    """Queue a followup event due at an absolute time. Returns (id, created).
+
+    Raises ValueError on a malformed or already-past time: an always-on agent
+    that schedules work in the past would either spin or silently drop it, so
+    the caller is told instead. Retries dedupe: the same slot parsed twice
+    yields the same source_id and INSERT OR IGNORE drops the second copy.
+    """
+    ts = parse_due_at(when)
+    if ts <= now():
+        raise ValueError(f"到期时间已经过去：{when}")
+    note = " ".join(note.split()) or "(未说明)"
+    return enqueue(conn, "followup", followup_source_id(ts, note),
+                   {"title": note, "text": note, "due_at": ts}, due_at=ts)
+
+
 def claim_next(conn: sqlite3.Connection, worker_id: str) -> sqlite3.Row | None:
-    """Atomically claim one pending event and mark it running under this worker.
+    """Atomically claim one pending event that is due now.
 
     Stamps worker_id and the starting heartbeat, which is the lease: other
-    workers may only take it back once this one stops beating. None if the queue
-    is empty.
+    workers may only take it back once this one stops beating. None if nothing
+    is due. due_at IS NULL is the pre-#14 row (due immediately); COALESCE keeps
+    the old id order for those and puts them ahead of scheduled ones.
     """
     ts = now()
     row = conn.execute(
         "UPDATE events SET status='running', worker_id=?, heartbeat_at=?, "
         "attempts=attempts+1, updated_at=? "
-        "WHERE id = (SELECT id FROM events WHERE status='pending' ORDER BY id LIMIT 1) "
+        "WHERE id = (SELECT id FROM events "
+        "            WHERE status='pending' AND (due_at IS NULL OR due_at <= ?) "
+        "            ORDER BY COALESCE(due_at, ''), id LIMIT 1) "
         "RETURNING *",
-        (worker_id, ts, ts),
+        (worker_id, ts, ts, ts),
     ).fetchone()
     conn.commit()
     return row
@@ -446,8 +502,112 @@ def _selftest() -> int:
     else:
         raise AssertionError("重复决策应该报错")
 
+    # ------------------------------------------------ timer / due_at (#14)
+    # A followup is just an event with a due time; nothing else in the state
+    # machine changes, which is what keeps the old rows' behaviour identical.
+    t = connect(":memory:")
+    future = (datetime.now(timezone.utc) + timedelta(hours=2)).isoformat(timespec="seconds")
+    past = (datetime.now(timezone.utc) - timedelta(seconds=5)).isoformat(timespec="seconds")
+
+    # due_at=None == due now (the pre-#14 path).
+    eid_null, _ = enqueue(t, "manual", "immediate-1")
+    assert t.execute("SELECT due_at FROM events WHERE id=?", (eid_null,)).fetchone()["due_at"] is None
+    got = claim_next(t, "timer-w")
+    assert got is not None and got["id"] == eid_null, dict(got or {})
+
+    # Not yet due: not claimable. Due: claimable. This is the whole feature.
+    eid_future, _ = enqueue(t, "manual", "later-1", due_at=future)
+    assert eid_future is not None
+    assert claim_next(t, "timer-w") is None, "未到 due_at 的事件被提前领走了"
+    t.execute("UPDATE events SET due_at=? WHERE id=?", (past, eid_future))
+    t.commit()
+    got = claim_next(t, "timer-w")
+    assert got is not None and got["id"] == eid_future, dict(got or {})
+    assert finish_event(t, eid_future, "done", "timer-w", got["attempts"]) is True
+
+    # schedule_followup: lands as a followup event carrying its due time...
+    fid1, created1 = schedule_followup(t, future, "复查 outbox 节流")
+    assert created1 is True and fid1 is not None, (fid1, created1)
+    row = t.execute("SELECT * FROM events WHERE id=?", (fid1,)).fetchone()
+    assert (row["source_type"], row["due_at"], row["status"]) == ("followup", future, "pending"), dict(row)
+    # The dedupe key is the ticket's formula and nothing else: no call time, no
+    # counter -- otherwise a retry a minute later would queue the same task again.
+    digest = hashlib.sha256("复查 outbox 节流".encode()).hexdigest()[:16]
+    assert row["source_id"] == f"{future}:{digest}", dict(row)
+    assert claim_next(t, "timer-w") is None, "刚排的 followup 不该现在就能领"
+
+    # ...and dedupes on (time, note): a retried run re-parses the same slot.
+    fid2, created2 = schedule_followup(t, future, "复查 outbox 节流")
+    assert created2 is False and fid2 == fid1, (fid2, created2)
+    assert t.execute("SELECT COUNT(*) c FROM events WHERE source_type='followup'").fetchone()["c"] == 1
+
+    # Same instant spelled with another offset is the same slot, not a second one.
+    tz8 = datetime.fromisoformat(future).astimezone(timezone(timedelta(hours=8)))
+    fid3, created3 = schedule_followup(t, tz8.isoformat(timespec="seconds"), "复查 outbox 节流")
+    assert created3 is False and fid3 == fid1, (created3, fid3, tz8.isoformat())
+
+    # A different task at the same time is a different event.
+    fid4, created4 = schedule_followup(t, future, "另一件事")
+    assert created4 is True and fid4 != fid1
+
+    # Malformed or already-past times raise and enqueue nothing: an agent that
+    # schedules into the past would spin, so the caller is told instead.
+    before = t.execute("SELECT COUNT(*) c FROM events").fetchone()["c"]
+    for bad in ("明天下午三点", "2026-13-45T99:00:00", past,
+                (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat(timespec="seconds")):
+        try:
+            schedule_followup(t, bad, "不该入队")
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"非法/过期时间 {bad!r} 应该报错而不是入队")
+    assert t.execute("SELECT COUNT(*) c FROM events").fetchone()["c"] == before, "非法时间产生了事件"
+    assert t.execute("SELECT COUNT(*) c FROM events WHERE source_type='followup'").fetchone()["c"] == 2
+    t.close()
+
+    # Migration: an old database (events without due_at) upgrades in place,
+    # keeps its rows claimable, and _migrate stays idempotent across connects.
+    import tempfile
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+        old_path = Path(td) / "old.db"
+        raw = sqlite3.connect(str(old_path))
+        raw.executescript("""
+            CREATE TABLE events (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                dedupe_key  TEXT NOT NULL UNIQUE,
+                source_type TEXT NOT NULL,
+                source_id   TEXT NOT NULL,
+                payload     TEXT NOT NULL DEFAULT '{}',
+                status      TEXT NOT NULL DEFAULT 'pending',
+                worker_id   TEXT,
+                heartbeat_at TEXT,
+                attempts    INTEGER NOT NULL DEFAULT 0,
+                created_at  TEXT NOT NULL,
+                updated_at  TEXT NOT NULL,
+                error       TEXT
+            );
+        """)
+        raw.execute("INSERT INTO events (dedupe_key, source_type, source_id, created_at, updated_at) "
+                    "VALUES ('legacy','manual','legacy-1',"
+                    "'2026-01-01T00:00:00+00:00','2026-01-01T00:00:00+00:00')")
+        raw.commit()
+        raw.close()
+        for _ in range(2):  # the second connect runs _migrate again
+            c = connect(old_path)
+            assert "due_at" in {r["name"] for r in c.execute("PRAGMA table_info(events)")}
+            legacy = c.execute("SELECT * FROM events WHERE source_id='legacy-1'").fetchone()
+            assert legacy is not None, "迁移后旧事件丢了"
+            assert legacy["due_at"] is None and legacy["status"] == "pending", dict(legacy)
+            c.close()
+        c = connect(old_path)
+        claimed = claim_next(c, "legacy-w")
+        assert claimed is not None and claimed["source_id"] == "legacy-1", \
+            "老库升级后旧事件领不到了"
+        c.close()
+
     conn.close()
-    print("db.py selftest OK: 去重 / 原子领取 / 租约心跳 / 状态流转 / 崩溃恢复 / 写路径 fence / 审批去重")
+    print("db.py selftest OK: 去重 / 原子领取 / 租约心跳 / 状态流转 / 崩溃恢复 / 写路径 fence / "
+          "审批去重 / 定时器 due_at / 迁移幂等")
     return 0
 
 

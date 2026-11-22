@@ -65,7 +65,7 @@ GitHub 上已经有 5 个同赛道项目（都叫 nightshift），它们解决�
 | 原语 | 作用 | wick 的实现 |
 |---|---|---|
 | **事件收件箱** | 所有触发统一进入口 | `events` 表 + 唯一索引去重 + 单 worker 串行消费 |
-| **定时器** | 到点叫醒 | `events.due_at`（ISO 时间）；`claim_next` 只领 `due_at IS NULL OR due_at <= now` 的行。**只产生事件，不直接执行** |
+| **定时器** | 到点叫醒 | `events.due_at`（ISO 时间）；`claim_next` 只领 `due_at IS NULL OR due_at <= now` 的行。agent 用「下次跟进」槽自排，人用 `cli.py schedule`。**只产生事件，不直接执行** |
 | **记忆** | 跨 run 的连续性 | `~/.wick/progress/<task>.md` + `index.md`（**在仓库之外**，见决策 14）；注入最近几轮 + 一行索引（只列在途任务）；恢复点是上一轮**已完成**的记录 |
 | **权限** | 无人值守的风险边界 | `approvals` 表：不可逆动作 → run 结束 → 等你批准 → 起新 run |
 | **投递队列** | 结果怎么到你手上 | `deliveries` 表 + 节流 + 失败重投 |
@@ -184,6 +184,18 @@ python src/outbox.py           # 自检
 单次发送超时固定 120 秒（`src/outbox.py` 里的 `SEND_TIMEOUT`，不读环境变量）。
 
 `WICK_SEND_CMD` 按命令行规则切分：Windows 上反斜杠原样保留，`C:\Tools\send.cmd` 可以直接写；路径含空格要加引号，例如 `WICK_SEND_CMD="C:\Program Files\send.cmd" -t feishu`。正斜杠两边都能用。
+
+---
+
+## 定时器（due_at）
+
+事件可以带一个到期时间：`events.due_at`，与 `db.now()` 同一种 ISO 格式，NULL = 立即到期（老行全是 NULL，行为不变）。`claim_next` 只领 `due_at IS NULL OR due_at <= now` 的行，所以「两小时后回来做」就是一条普通事件——没有 cron、时区处理、优先级。
+
+```
+python src/cli.py schedule 2026-11-23T09:00:00+08:00 "复查 outbox 节流"
+```
+
+agent 自己也能排：fix / analyze 两个模板的输出槽 `下次跟进：<ISO 时间> <做什么>`，run 结束后解析成 `source_type='followup'` 的事件。同一时间 + 同一说明靠去重只入一条（retry 重跑重复解析挡得住）；时间非法或已过期只记 warning，不会搞挂一次成功的 run。不带时区偏移的输入按本机时区解释，入库前统一成 UTC。
 
 ---
 

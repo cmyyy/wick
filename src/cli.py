@@ -9,6 +9,7 @@ Usage:
     python src/cli.py approve <id>
     python src/cli.py reject <id>
     python src/cli.py retry <event_id>
+    python src/cli.py schedule <ISO 时间> <做什么>
 """
 from __future__ import annotations
 
@@ -146,6 +147,21 @@ def cmd_retry(args) -> int:
         conn.close()
 
 
+def cmd_schedule(args) -> int:
+    """Queue a followup by hand, the same way the agent queues its own (#14)."""
+    conn = connect(args)
+    try:
+        eid, created = db.schedule_followup(conn, args.when, args.what)
+        verb = f"已排 followup #{eid}" if created else f"已存在 followup #{eid}（dedupe 命中，未重复入队）"
+        print(f"{verb}：{args.when} {args.what}")
+        return 0
+    except ValueError as exc:
+        print(f"排不上：{exc}（时间要 ISO 8601，且必须在将来）", file=sys.stderr)
+        return 1
+    finally:
+        conn.close()
+
+
 # ---------------------------------------------------------------- selftest
 
 def _selftest() -> int:
@@ -247,6 +263,10 @@ def main() -> int:
     p = sub.add_parser("retry", help="把 done/failed 事件重新排回 pending（保留 attempts）")
     p.add_argument("id", type=int, help="事件 id（src/cli.py status 里能看到）")
     p.set_defaults(func=cmd_retry)
+    p = sub.add_parser("schedule", help="给未来的自己排一个 followup")
+    p.add_argument("when", help="ISO 时间，如 2026-11-23T09:00:00+08:00（不带偏移按本机时区）")
+    p.add_argument("what", help="到时候做什么")
+    p.set_defaults(func=cmd_schedule)
 
     args = ap.parse_args()
     return args.func(args)

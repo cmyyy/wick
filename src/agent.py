@@ -20,6 +20,7 @@ if throughput ever matters, this is where a resident gateway client would go.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import subprocess
@@ -32,6 +33,8 @@ HERMES_BIN = os.environ.get("WICK_HERMES_BIN", "hermes")
 DEFAULT_TIMEOUT = 900      # seconds; a real code-reading run can take minutes
 FIX_TIMEOUT = 1500         # editing plus testing takes longer than pure analysis
 CHECK_TIMEOUT = 300
+
+log = logging.getLogger("wick.agent")
 
 # The project's own self-checks double as its regression suite: four scripts,
 # each assert-based, no test framework. Green here means nothing broke.
@@ -210,6 +213,60 @@ def compose_fix_report(payload: dict, text: str, run_error: Exception | None,
     return "\n".join(head + body)
 
 
+# `下次跟进：<ISO 时间> <做什么>`. The time may use T or a space and may carry a
+# Z/±hh:mm offset; anything else is handed to db.schedule_followup(), which
+# rejects it with ValueError rather than guessing.
+_DUE_RE = re.compile(
+    r"(\d{4}-\d{2}-\d{2}(?:[T ]\d{2}:\d{2}(?::\d{2})?)?(?:Z|[+-]\d{2}:\d{2})?)\s*(.*)",
+    re.S,
+)
+
+
+def next_followup(text: str) -> tuple[str, str] | None:
+    """Split the output's `下次跟进` line into (when, what).
+
+    None means "nothing to come back to": the line is absent, or the model wrote
+    `无`. Parsing is deliberately forgiving -- validation (and dedupe) belong to
+    db.schedule_followup().
+    """
+    for line in text.splitlines():
+        line = line.strip().lstrip("*#>- ").strip()
+        if not line.startswith("下次跟进"):
+            continue
+        for sep in ("：", ":"):
+            if sep in line:
+                value = line.split(sep, 1)[1].strip()
+                break
+        else:
+            return None
+        if not value or value.startswith("无"):
+            return None
+        m = _DUE_RE.match(value)
+        if m is None:
+            return value, "(未说明)"
+        return m.group(1), m.group(2).strip() or "(未说明)"
+    return None
+
+
+def _queue_followup(conn, text: str) -> None:
+    """Queue the followup slot the agent just wrote, if any.
+
+    Never raises. The run has already succeeded by the time this is called; a
+    malformed time or a DB hiccup costs one warning line, not a failed event.
+    """
+    slot = next_followup(text)
+    if slot is None:
+        return
+    when, note = slot
+    try:
+        import db as dbmod
+        eid, created = dbmod.schedule_followup(conn, when, note)
+    except Exception as exc:
+        log.warning("下次跟进没排上（%s）：%s", when, exc)
+        return
+    log.info("下次跟进 %s #%s（%s）：%s", "已排" if created else "已存在", eid, when, note)
+
+
 def handle_event(conn, event) -> str:
     """D3 path: read-only analysis, no worktree, no file changes.
 
@@ -236,6 +293,7 @@ def handle_event(conn, event) -> str:
     progressmod.append(task, verdict=verdict_of(text),
                        checks="—（只读分析，未改代码）", leftover=leftover_of(text),
                        report=text, conn=conn, guard=guard)
+    _queue_followup(conn, text)
     return text
 
 
@@ -268,6 +326,10 @@ def handle_issue_fix(conn, event) -> str:
                           cwd=worktree, timeout=FIX_TIMEOUT)
     except Exception as exc:  # still collect the diff before failing
         run_error = exc
+
+    # The run is over, so whatever it wanted to come back to can be queued now.
+    # Never raises: a scheduling hiccup must not fail a run that worked.
+    _queue_followup(conn, text)
 
     checks = run_checks(worktree)
     changes = sandbox.diff(PROJECT_ROOT, worktree)
@@ -505,6 +567,60 @@ def _selftest() -> int:
              sandbox.create, sandbox.diff) = saved
     fconn.close()
 
+    # Timer (#14): both templates carry the self-scheduling slot, and the slot
+    # is parsed per the format the templates promise.
+    for tpl, name in ((prompt, "issue.md"), (fix, "issue_fix.md")):
+        assert "下次跟进：<ISO 时间>" in tpl, name
+        assert "ISO 8601" in tpl, name
+
+    assert next_followup("判定：可处理\n下次跟进：2026-11-23T09:00:00+08:00 复查 outbox 节流") == \
+        ("2026-11-23T09:00:00+08:00", "复查 outbox 节流")
+    assert next_followup("**下次跟进：无**") is None
+    assert next_followup("判定：可处理\n\n原因：...") is None
+    assert next_followup("下次跟进: 2026-11-23 09:00 复查") == ("2026-11-23 09:00", "复查")
+    assert next_followup("- 下次跟进：2026-11-23 复查") == ("2026-11-23", "复查")
+    assert next_followup("下次跟进：2026-11-23T09:00:00Z") == \
+        ("2026-11-23T09:00:00Z", "(未说明)")
+
+    # The real queue path: what the agent writes lands in events, deduped, and
+    # a bad or past time is a warning instead of an exception.
+    import db as dbmod
+    from datetime import datetime as _dt, timedelta as _td, timezone as _tz
+    aconn = dbmod.connect(":memory:")
+    later = (_dt.now(_tz.utc) + _td(hours=3)).isoformat(timespec="seconds")
+    said = f"判定：可处理\n下次跟进：{later} 复查 outbox 节流"
+    _queue_followup(aconn, said)
+    _queue_followup(aconn, said)  # a retried run re-parses the same slot
+    rows = aconn.execute("SELECT source_type, source_id, due_at FROM events").fetchall()
+    assert len(rows) == 1, [dict(r) for r in rows]
+    assert rows[0]["source_type"] == "followup" and rows[0]["due_at"] == later, dict(rows[0])
+    assert rows[0]["source_id"].startswith(f"{later}:"), dict(rows[0])
+    gone = (_dt.now(_tz.utc) - _td(minutes=5)).isoformat(timespec="seconds")
+    _queue_followup(aconn, "下次跟进：明天下午三点 复查")   # unparseable
+    _queue_followup(aconn, f"下次跟进：{gone} 已经过去的时间")  # expired
+    _queue_followup(aconn, "下次跟进：无")
+    _queue_followup(aconn, "判定：可处理")                    # no slot at all
+    assert aconn.execute("SELECT COUNT(*) c FROM events").fetchone()["c"] == 1, \
+        "非法/过期/无 的跟进不该入队，也不该抛异常"
+
+    # handle_event itself must queue the slot -- not just the helper. Stub the
+    # model call so this exercises the real handler.
+    event = {"id": 9, "source_type": "github_issue",
+             # #13 fences the progress write on the claim, so a bare dict has to
+             # carry the same three fields claim_next would have stamped.
+             "attempts": 1, "worker_id": "w-timer",
+             "payload": json.dumps({"repo": "a/b", "number": 9})}
+    said2 = f"判定：可处理\n下次跟进：{later} 复核完再跟进"
+    real_run = globals()["run_prompt"]
+    globals()["run_prompt"] = lambda prompt, **kw: said2
+    try:
+        assert handle_event(aconn, event) == said2
+    finally:
+        globals()["run_prompt"] = real_run
+    assert aconn.execute("SELECT COUNT(*) c FROM events").fetchone()["c"] == 2, \
+        "handle_event 跑完没有把「下次跟进」排进 events"
+    aconn.close()
+
     # The check runner must actually detect a broken worktree.
     import tempfile
     with tempfile.TemporaryDirectory() as td:
@@ -526,7 +642,7 @@ def _selftest() -> int:
         assert not checks["all_ok"] and checks["passed"] == total - 1, checks
         assert "src/db.py" in _checks_line(checks)
 
-    print("agent.py selftest OK: 模板渲染 / 判定解析 / 进度两槽且不是权威 / 自检真能失败 / "
+    print("agent.py selftest OK: 模板渲染 / 判定解析 / 进度两槽且不是权威 / 下次跟进入队与去重 / 自检真能失败 / "
           "分析路径两轮看到上一轮报告 / fix 路径经 handle_issue_fix 注入上一轮文件·自检·遗留·patch")
     return 0
 
