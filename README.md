@@ -30,7 +30,7 @@ GitHub 上已经有 5 个同赛道项目（都叫 nightshift），它们解决�
 | | 是什么 |
 |---|---|
 | **wick（这个仓库）** | 一个常驻 agent：事件进 `events` 表，worker 消费，结果进 `deliveries`，不可逆动作停下等人批准 |
-| **wick 的开发过程** | 人工编排 + 多个 bot 分工（一个 orchestrator 拆任务、一个 implementer 写代码、一个 reviewer 审查），人在环上拍板 |
+| **wick 的开发过程** | 人工编排 + 三个 bot 分工：orchestrator（拆任务）、implementer（写代码）、reviewer（审 PR），人在环上拍板 |
 
 **这两件事现在还没接上。** 开发 wick 时派活走固定的 `Bot Chat` 会话（Hermes 原生 bot mode），结果从该会话取，不经过本仓库的 `events` / `deliveries`。
 
@@ -42,6 +42,15 @@ GitHub 上已经有 5 个同赛道项目（都叫 nightshift），它们解决�
 正确的是：
 
 - ✅ "wick 是产品形态；当前开发流程是人工编排 + bot 分工"
+
+**术语警告**：`worker` 这个词在两个语境里指不同东西，读文档时别串：
+
+| 写在哪 | 指什么 | 特征 |
+|---|---|---|
+| `src/worker.py`、架构图、可靠性验收 | **产品的 worker** | 常驻进程，消费 `events` 表，有租约/心跳/attempt fence |
+| 「派活」「implementer」 | **开发时的 bot** | `wick-dev-1`，人是它的调度器，经由固定 `Bot Chat` 会话 |
+
+两者共用的只有"处理一件事"这个语义。产品的 worker 是代码，开发的 bot 是人手里的工具，**现在还没有任何一行代码把它们连起来**——那正是下面说的 D9 之后要做的事。
 
 **什么时候接上**：D9 可靠性验收通过之后（重复投递 0、崩溃恢复可用），再把派活改成写 `events` 表、结果进 `deliveries`。在那之前拿半成品当开发工具，等于在沼泽地上盖房子。
 
