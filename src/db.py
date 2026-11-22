@@ -38,6 +38,9 @@ DEFAULT_DB = Path(os.environ.get("WICK_DB") or Path.home() / ".wick" / "wick.db"
 # presumed dead. Keep the beat well under it: worker.HEARTBEAT_INTERVAL.
 LEASE_SECONDS = 90
 
+# Lifetime count of reclaimed stale leases; the panel reads it (issue #20).
+STALE_METRIC = "stats:stale_requeued"
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS events (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -281,7 +284,14 @@ def requeue_stale(conn: sqlite3.Connection) -> int:
         (now(), cutoff),
     )
     conn.commit()
-    return cur.rowcount
+    reclaimed = cur.rowcount
+    if reclaimed:
+        # Cumulative, not "last run": this is the lifetime count of reclaims, and
+        # the panel shows it. Only write when something was actually reclaimed --
+        # a 0 row would be indistinguishable from a stale counter nobody updates.
+        total = int(get_meta(conn, STALE_METRIC) or 0)
+        set_meta(conn, STALE_METRIC, str(total + reclaimed))
+    return reclaimed
 
 
 # -------------------------------------------------------------- deliveries
@@ -434,8 +444,11 @@ def _selftest() -> int:
     # Crash recovery: rows left running by a worker that stopped beating go back to pending.
     conn.execute("UPDATE events SET heartbeat_at=? WHERE id=?", (stale, ev2["id"]))
     conn.commit()
+    assert get_meta(conn, STALE_METRIC) is None, "还没回收过就不该有这个计数"
     n = requeue_stale(conn)
     assert n == 1, n  # only ev2 is still running
+    # Issue #20: the panel reads this as a lifetime counter.
+    assert get_meta(conn, STALE_METRIC) == "1", get_meta(conn, STALE_METRIC)
     row = conn.execute("SELECT status, worker_id FROM events WHERE id=?", (ev2["id"],)).fetchone()
     assert row["status"] == "pending" and row["worker_id"] is None, dict(row)
 
@@ -453,6 +466,12 @@ def _selftest() -> int:
     conn.execute("UPDATE events SET heartbeat_at=? WHERE id=?", (stale, eid4))
     conn.commit()
     assert requeue_stale(conn) == 1
+    # Issue #20：累加，不是"最后一次回收几条"。
+    assert get_meta(conn, STALE_METRIC) == "2", get_meta(conn, STALE_METRIC)
+    # 回收 0 条时不写：不留一个和"没人更新"分不清的 0。
+    before = get_meta(conn, STALE_METRIC)
+    assert requeue_stale(conn) == 0
+    assert get_meta(conn, STALE_METRIC) == before, "回收 0 条时不该改动计数"
     # 回收后还没被接手（pending）：旧 worker 说什么都不算数。
     assert finish_event(conn, eid4, "done", "worker-A", 1) is False
     b = claim_next(conn, "worker-B")
