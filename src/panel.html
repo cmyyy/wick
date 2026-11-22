@@ -1,0 +1,274 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>wick 面板</title>
+<style>
+  :root { color-scheme: light dark; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 20px; font: 13px/1.5 -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
+    background: #f6f7f9; color: #1d2129;
+  }
+  @media (prefers-color-scheme: dark) {
+    body { background: #16181d; color: #e6e8eb; }
+    .card { background: #1e2127; border-color: #2b2f37; }
+    th { color: #9aa1ac; }
+    td, th { border-color: #2b2f37; }
+    .empty { color: #7d848f; }
+    button { background: #2b2f37; color: #e6e8eb; border-color: #3a3f49; }
+    button.primary { background: #2f6feb; border-color: #2f6feb; color: #fff; }
+  }
+  header { display: flex; align-items: baseline; gap: 12px; margin-bottom: 16px; }
+  h1 { font-size: 18px; margin: 0; }
+  h2 { font-size: 13px; margin: 0 0 10px; }
+  h2 .count { color: #8a9099; font-weight: 400; margin-left: 6px; }
+  #note { color: #d4380d; font-size: 12px; }
+  .card { background: #fff; border: 1px solid #e5e6eb; border-radius: 8px; padding: 14px 16px; margin-bottom: 14px; }
+  .stats { display: flex; flex-wrap: wrap; gap: 28px; }
+  .stat .label { font-size: 11px; color: #8a9099; }
+  .stat .value { font-size: 20px; font-weight: 600; }
+  .stat .hint { font-size: 11px; color: #8a9099; }
+  table { width: 100%; border-collapse: collapse; font-size: 12px; }
+  th { text-align: left; font-weight: 500; color: #8a9099; padding: 4px 8px; }
+  td { padding: 4px 8px; border-top: 1px solid #eef0f3; vertical-align: top; }
+  td.num { text-align: right; font-variant-numeric: tabular-nums; }
+  .tag { display: inline-block; padding: 0 6px; border-radius: 4px; background: #eef0f3; font-size: 11px; }
+  .tag.done, .tag.sent, .tag.approved { background: #d9f2e0; color: #11643a; }
+  .tag.failed { background: #ffe0e0; color: #a02b2b; }
+  .tag.running, .tag.throttled { background: #fff2d1; color: #8a5a00; }
+  .empty { color: #8a9099; padding: 6px 0; }
+  button { font: inherit; font-size: 12px; padding: 2px 10px; border-radius: 4px; border: 1px solid #d5d8de; background: #fff; cursor: pointer; }
+  button.primary { background: #2f6feb; border-color: #2f6feb; color: #fff; }
+  button + button { margin-left: 6px; }
+  button:disabled { opacity: .5; cursor: default; }
+  footer { color: #8a9099; font-size: 11px; margin-top: 4px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>wick</h1>
+  <span id="note"></span>
+</header>
+
+<section class="card">
+  <h2>健康度</h2>
+  <div class="stats" id="health"></div>
+</section>
+
+<section class="card">
+  <h2>待批准<span class="count" id="approvals-count"></span></h2>
+  <div id="approvals"></div>
+</section>
+
+<section class="card">
+  <h2>事件流<span class="count" id="events-count"></span></h2>
+  <div id="events"></div>
+</section>
+
+<section class="card">
+  <h2>投递记录<span class="count" id="deliveries-count"></span></h2>
+  <div id="deliveries"></div>
+</section>
+
+<footer>5 秒自动刷新；后台标签页不轮询。数据直接来自 wick 的 sqlite，没有缓存层。</footer>
+
+<script>
+(function () {
+  "use strict";
+
+  var POLL_MS = 5000;
+  var EMPTY = "无数据（数据库读不到）";
+
+  function $(id) { return document.getElementById(id); }
+
+  function el(tag, text, cls) {
+    var node = document.createElement(tag);
+    if (text !== null && text !== undefined) node.textContent = String(text);
+    if (cls) node.className = cls;
+    return node;
+  }
+
+  function tag(status) { return el("span", status, "tag " + status); }
+
+  function short(value, max) {
+    var text = typeof value === "string" ? value : JSON.stringify(value);
+    if (!text) return "—";
+    return text.length > max ? text.slice(0, max) + "…" : text;
+  }
+
+  function when(ts) { return ts ? String(ts).replace("T", " ").slice(0, 19) : "—"; }
+
+  // Two different empty states, and they must not be confused: `null` means the
+  // fetch failed / the database is unreadable; `[]` means there is simply
+  // nothing to show yet.
+  function emptyBox(text) { return el("div", text || EMPTY, "empty"); }
+
+  // 空态判字段：后端读不到库时返回 {}，{} 在 JS 里是 truthy，判对象真假会把空态
+  // 当成真数据一路算成 NaN%。
+  function renderHealth(stats) {
+    var box = $("health");
+    box.textContent = "";
+    if (!stats || stats.events_total == null) { box.appendChild(emptyBox()); return; }
+    var rate = stats.duplicate_rate;
+    var cells = [
+      ["事件总数", stats.events_total, "失败 " + stats.events_failed],
+      ["重复处理率", (rate * 100).toFixed(rate === 0 ? 0 : 1) + "%",
+        stats.duplicate_events + " / " + stats.events_with_sent_delivery + " 个已通知事件"],
+      // 假死回收的计数还没有写者（issue #20）：说「未接入」，不说 0。
+      ["假死回收", stats.stale_requeued == null ? "未接入" : stats.stale_requeued, "stats:stale_requeued"],
+      ["今日投递", stats.deliveries_today, "UTC 当日"]
+    ];
+    cells.forEach(function (c) {
+      var cell = el("div", null, "stat");
+      cell.appendChild(el("div", c[0], "label"));
+      cell.appendChild(el("div", c[1], "value"));
+      cell.appendChild(el("div", c[2], "hint"));
+      box.appendChild(cell);
+    });
+  }
+
+  function table(headers, rows, build, emptyText) {
+    if (rows === null || rows === undefined) return emptyBox(EMPTY);  // 读不到
+    if (!rows.length) return emptyBox(emptyText);                     // 没有记录
+    var t = el("table");
+    var head = el("thead");
+    var htr = el("tr");
+    headers.forEach(function (name) { htr.appendChild(el("th", name)); });
+    head.appendChild(htr);
+    t.appendChild(head);
+    var body = el("tbody");
+    rows.forEach(function (row) {
+      var tr = el("tr");
+      build(tr, row);
+      body.appendChild(tr);
+    });
+    t.appendChild(body);
+    return t;
+  }
+
+  function td(text, cls) {
+    var node = el("td", text, cls || null);
+    return node;
+  }
+
+  function renderApprovals(rows, busy) {
+    $("approvals-count").textContent = rows && rows.length ? " " + rows.length : "";
+    var host = $("approvals");
+    host.textContent = "";
+    host.appendChild(table(["动作", "目标 / 详情", "创建时间", ""], rows, function (tr, a) {
+      tr.appendChild(td(a.action));
+      tr.appendChild(td(short(a.detail, 90)));
+      tr.appendChild(td(when(a.created_at)));
+      var cell = el("td");
+      var yes = el("button", busy === a.id ? "…" : "批准", "primary");
+      var no = el("button", "拒绝");
+      yes.disabled = no.disabled = busy === a.id;
+      yes.onclick = function () { decide(a.id, true); };
+      no.onclick = function () { decide(a.id, false); };
+      cell.appendChild(yes);
+      cell.appendChild(no);
+      tr.appendChild(cell);
+    }, "没有待批准的请求"));
+  }
+
+  // due_at 在将来 → 「预定 11-23 09:00」。否则「排在未来」和「该跑没人跑」长得一模一样。
+  function dueLabel(due) {
+    if (!due) return null;
+    var ts = Date.parse(due);
+    if (isNaN(ts) || ts <= Date.now()) return null;
+    var d = new Date(ts);
+    function pad(n) { return ("0" + n).slice(-2); }
+    return "预定 " + pad(d.getMonth() + 1) + "-" + pad(d.getDate()) + " " +
+      pad(d.getHours()) + ":" + pad(d.getMinutes());
+  }
+
+  function renderEvents(rows) {
+    $("events-count").textContent = rows && rows.length ? " " + rows.length : "";
+    var host = $("events");
+    host.textContent = "";
+    host.appendChild(table(["ID", "来源", "状态", "尝试", "创建时间"], rows, function (tr, e) {
+      tr.appendChild(td(e.id, "num"));
+      // followup 的 source_id 是 `<due_at>:<sha256>`，对人不构成信息；取 payload.title。
+      var isDue = e.source_type === "followup";
+      var source = isDue
+        ? "定时器 · " + short((e.payload && e.payload.title) || e.source_id, 40)
+        : e.source_type + " · " + short(e.source_id, 40);
+      tr.appendChild(td(source));
+      var st = el("td");
+      var due = dueLabel(e.due_at);
+      if (due) st.appendChild(el("span", due, "tag running"));
+      else st.appendChild(tag(e.status));
+      tr.appendChild(st);
+      tr.appendChild(td(e.attempts, "num"));
+      tr.appendChild(td(when(e.created_at)));
+    }, "还没有事件"));
+  }
+
+  function renderDeliveries(rows) {
+    $("deliveries-count").textContent = rows && rows.length ? " " + rows.length : "";
+    var host = $("deliveries");
+    host.textContent = "";
+    host.appendChild(table(["渠道", "状态", "尝试", "创建时间", "内容"], rows, function (tr, d) {
+      tr.appendChild(td(d.channel));
+      var st = el("td");
+      st.appendChild(tag(d.status));
+      tr.appendChild(st);
+      tr.appendChild(td(d.attempts, "num"));
+      tr.appendChild(td(when(d.created_at)));
+      tr.appendChild(td(short(d.body, 80)));
+    }, "还没有投递"));
+  }
+
+  var busy = null;
+
+  function getJSON(path) {
+    return fetch(path, { headers: { "Accept": "application/json" } })
+      .then(function (r) { return r.ok ? r.json() : null; })
+      .catch(function () { return null; });
+  }
+
+  function load(force) {
+    // Background tabs must not poll, but the FIRST paint has to happen even when
+    // the tab opens in the background -- otherwise the panel stays blank until
+    // the user happens to bring it forward.
+    if (!force && document.hidden) return;
+    Promise.all(["/events", "/approvals", "/deliveries", "/stats"].map(getJSON))
+      .then(function (res) {
+        // 保留 null：null = 这次请求失败（渲染成"读不到"），[] = 确实没有记录。
+        var events = res[0], approvals = res[1];
+        var deliveries = res[2], stats = res[3];
+        renderHealth(stats);
+        renderApprovals(approvals, busy);
+        renderEvents(events);
+        renderDeliveries(deliveries);
+      });
+  }
+
+  function decide(id, approve) {
+    busy = id;
+    $("note").textContent = "";
+    // X-Wick-Panel 不是 CORS 简单头：跨站页面必须先发预检，而本服务不答 OPTIONS。
+    fetch("/approvals/" + id + (approve ? "/approve" : "/reject"),
+          { method: "POST", headers: { "X-Wick-Panel": "1" } })
+      .then(function (r) { return r.ok ? r.json() : { updated: 0 }; })
+      .then(function (out) {
+        // 面板只改状态：真正执行要等 worker 下一轮
+        if (!out.updated) $("note").textContent = "该审批已不是 waiting，刷新后不可再操作";
+        else $("note").textContent = (approve ? "已批准 #" : "已拒绝 #") + id + "，等 worker 执行";
+        busy = null;
+        return getJSON("/approvals").then(function (rows) { renderApprovals(rows, busy); });
+      })
+      .catch(function (err) {
+        busy = null;
+        $("note").textContent = "操作失败：" + err.message;
+      });
+  }
+
+  load(true);
+  setInterval(function () { load(false); }, POLL_MS);
+})();
+</script>
+</body>
+</html>

@@ -49,6 +49,7 @@ CHECKS = [
     ["src/cli.py", "selftest"],
     ["src/outbox.py"],
     ["eval/run.py", "--selftest"],
+    ["src/server.py", "--selftest"],
 ]
 
 VERDICTS_FIX = ("已修复", "部分修复", "无法修复")
@@ -630,7 +631,7 @@ def _selftest() -> int:
         good = "print('ok')\n"
         for rel in ("src/db.py", "src/worker.py", "src/sources/github.py", "src/agent.py",
                     "src/sandbox.py", "src/actions.py", "src/progress.py", "src/cli.py",
-                    "src/outbox.py", "eval/run.py"):
+                    "src/outbox.py", "src/server.py", "eval/run.py"):
             (wt / rel).parent.mkdir(parents=True, exist_ok=True)
             (wt / rel).write_text(good, encoding="utf-8")
         checks = run_checks(wt)
