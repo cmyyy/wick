@@ -3,10 +3,27 @@
 ## 铁律
 
 1. **每个改动都有 issue。** 没有 issue 的改动不开工。
-2. **派活给 bot 之前先发 ticket。** 缺陷清单、验收标准、执行者、分支写进 issue 评论，然后再派给 dev。先派后补等于没有依据，而且事后写不进当初的判断。
+2. **派活之前先发 ticket。** 验收标准、执行者、分支写进 issue 评论，然后再派。先派后补等于没有依据，而且事后写不进当初的判断。派活的 prompt **只给 issue 地址**，不复制 issue 内容（见「派活纪律」）。
 3. **每个改动都走分支 + PR。** 谁都不直接 push `main`，**包括项目自己的 agent**。
 4. **自检全过才能提 PR。**
 5. **PR 由人 review 后 merge。** agent 可以开 PR，不可以 merge。
+
+## 派活纪律
+
+派活只给三样东西，不给背景：
+
+```bash
+hermes -p developer chat --in ~ -c "Bot Chat" --create-if-missing -Q -q   "实现 https://github.com/cmyyy/wick/issues/<n>。工作目录 <worktree>，分支 <branch>。只在 worktree 里改，不要 commit/push/开 PR。"
+```
+
+三条理由，对齐 x.ai 对 Grok Bot 的设计（https://x.ai/news/designing-grok-bot）：
+
+- **记忆跟着 bot，不跟着任务。** `Bot Chat` 是固定会话名，同一个 bot 跨任务累积。`hermes -p <name> -z` 是一次性的，它不记得上一个任务的任何判断；`--continue` 也不用，它接「最近一次会话」，并发或换目录时会接错。
+- **不复制上下文。** issue 是唯一事实源。把背景、约束、验收标准抄进 prompt，等于给 bot 发一份可能过期的副本 —— x.ai 原话：「Do not copy shared context into each Bot. That is the drift mechanism, and it fails silently.」**约束没写进 issue 就是没写**，下一个读 issue 的人看不到它。
+- **一次一个任务。** Bot Chat 里混着多个在飞的 issue，bot 会串。做完一个再下一个。
+
+**issue 里写什么**：做什么、怎么算做完、硬要求（不许做什么）。
+**不写什么**：为什么做这件事 —— 它自己去代码、README、`DECISIONS.md` 里查得出来。
 
 ## 分支命名
 
