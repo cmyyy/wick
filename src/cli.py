@@ -276,6 +276,7 @@ def main() -> int:
     p.set_defaults(func=cmd_schedule)
     p = sub.add_parser("panel", help="起本地面板（D8）")
     p.add_argument("--port", type=int, default=9119, help="监听端口（0 = 让 OS 分配）")
+    p.add_argument("--db", default=None, help="数据库路径（默认 WICK_DB 或 ~/.wick/wick.db）")
     p.set_defaults(func=cmd_panel)
 
     args = ap.parse_args()

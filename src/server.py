@@ -8,8 +8,12 @@ Why not a Hermes plugin: issue #5 — both plugin routes died on Hermes-internal
 discovery/auth/version differences, none of which wick controls.
 
 Five GETs (the page itself + four data blocks) and two POSTs (approve/reject).
-Reads use a ``mode=ro`` connection, so opening the panel never creates a
-database, and a missing table degrades to "no data" instead of an error page.
+A POST is accepted only from the panel page itself: it must carry
+``X-Wick-Panel: 1`` (a non-simple header, so a cross-site page owes a preflight
+this server never answers), say ``Sec-Fetch-Site: same-origin|none``, and
+arrive with the Host we bound — see ``Handler._post_refusal``. Reads use a
+``mode=ro`` connection, so opening the panel never creates a database, and a
+missing table degrades to ``null`` ("cannot read") instead of an error page.
 Approving only writes ``approvals.status``/``decided_at`` via
 ``db.decide_approval``; the one path that acts on an approval is
 ``worker.process_approvals`` (DECISIONS #7). This module never imports actions.
@@ -23,7 +27,7 @@ import sqlite3
 import sys
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
 from urllib.parse import parse_qs, urlparse
 
 sys.path.insert(0, str(Path(__file__).parent))
@@ -61,22 +65,29 @@ def _limit(query: dict) -> int:
 
 
 # ------------------------------------------------------------------- 读四块
-# Each reader folds its own failure into "no data": a panel that cannot reach
-# the database shows an empty block, never a traceback.
+# Each reader folds its own failure into None ("cannot read"), so the page can
+# tell "the queue is empty" ([]) apart from "the database is unreachable"
+# (null). health() folds the same way, into {}.
 
-def list_events(db_path, limit: int = LIMIT_DEFAULT) -> list[dict]:
+def list_events(db_path, limit: int = LIMIT_DEFAULT) -> list[dict] | None:
     try:
-        return _rows(
+        rows = _rows(
             db_path,
-            "SELECT id, source_type, source_id, status, attempts, due_at, "
+            "SELECT id, source_type, source_id, payload, status, attempts, due_at, "
             "created_at, updated_at, error FROM events ORDER BY id DESC LIMIT ?",
             (limit,),
         )
     except Exception:
-        return []
+        return None
+    for row in rows:
+        try:
+            row["payload"] = json.loads(row["payload"] or "{}")
+        except (TypeError, ValueError):
+            row["payload"] = {}
+    return rows
 
 
-def list_approvals(db_path) -> list[dict]:
+def list_approvals(db_path) -> list[dict] | None:
     try:
         rows = _rows(
             db_path,
@@ -84,7 +95,7 @@ def list_approvals(db_path) -> list[dict]:
             "WHERE status='waiting' AND executed_at IS NULL ORDER BY id DESC",
         )
     except Exception:
-        return []
+        return None
     for row in rows:
         try:
             row["detail"] = json.loads(row["detail"] or "{}")
@@ -93,7 +104,7 @@ def list_approvals(db_path) -> list[dict]:
     return rows
 
 
-def list_deliveries(db_path, limit: int = LIMIT_DEFAULT) -> list[dict]:
+def list_deliveries(db_path, limit: int = LIMIT_DEFAULT) -> list[dict] | None:
     try:
         rows = _rows(
             db_path,
@@ -102,7 +113,7 @@ def list_deliveries(db_path, limit: int = LIMIT_DEFAULT) -> list[dict]:
             (limit,),
         )
     except Exception:
-        return []
+        return None
     for row in rows:
         row["body"] = (row.get("body") or "")[:BODY_SUMMARY_CHARS]
     return rows
@@ -160,11 +171,16 @@ def health(db_path) -> dict:
 # ---------------------------------------------------------------- 两个 POST
 
 def decide(db_path, approval_id: int, approved: bool) -> dict:
-    """Flip one waiting approval. Nothing is executed here, by design."""
+    """Flip one waiting approval. Nothing is executed here, by design.
+
+    Own connection instead of db.connect(): that one mkdirs, runs the schema
+    script and flips journal_mode=WAL, so approving against an empty file would
+    fabricate four tables. This touches exactly one row and nothing else.
+    """
     path = Path(db_path)
     if not path.exists():
         return {"updated": 0, "id": approval_id}
-    conn = db.connect(path)
+    conn = sqlite3.connect(str(path), timeout=30)
     try:
         db.decide_approval(conn, approval_id, approved)  # raises when not waiting
         return {"updated": 1, "id": approval_id}
@@ -207,7 +223,45 @@ class Handler(BaseHTTPRequestHandler):
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         self._send(body, "application/json; charset=utf-8", status)
 
+    def _drain_body(self) -> None:
+        """Read and discard the body: HTTP/1.1 keep-alive desyncs on leftover bytes."""
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except (TypeError, ValueError):
+            length = 0
+        if length > 0:
+            self.rfile.read(length)
+
+    def _host_ok(self) -> bool:
+        """Host must be exactly what we bound — a rebinding name cannot read or write."""
+        host, port = self._panel().server_address[:2]
+        return self.headers.get("Host") == f"{host}:{port}"
+
+    def _post_refusal(self) -> str | None:
+        """Why this POST is not from the panel page itself, or None when it is.
+
+        Three independent layers, because the approval POST is the system's only
+        human gate (worker commits/pushes the next tick) and browsers differ:
+        - X-Wick-Panel is not a CORS-simple header, so a cross-site page must
+          send a preflight first, and this server never answers OPTIONS;
+        - Sec-Fetch-Site is the browser's own answer to "where did this come
+          from" — absent means it is not a browser we trust (curl, an old
+          browser), so it is refused too;
+        - Host stops DNS rebinding: a name that resolves to 127.0.0.1 still
+          carries its own Host.
+        """
+        if not self._host_ok():
+            return "bad Host"
+        if self.headers.get("X-Wick-Panel") != "1":
+            return "missing X-Wick-Panel"
+        if self.headers.get("Sec-Fetch-Site") not in ("same-origin", "none"):
+            return "cross-site POST refused"
+        return None
+
     def do_GET(self):  # noqa: N802 — BaseHTTPRequestHandler's spelling
+        if not self._host_ok():
+            self._send_json({"error": "bad Host"}, 403)
+            return
         url = urlparse(self.path)
         if url.path in ("/", "/index.html", "/panel.html"):
             try:
@@ -229,6 +283,11 @@ class Handler(BaseHTTPRequestHandler):
         self._send_json(route())
 
     def do_POST(self):  # noqa: N802
+        self._drain_body()  # before any early return, or the next request on this socket misparses
+        refusal = self._post_refusal()
+        if refusal is not None:
+            self._send_json({"error": refusal, "updated": 0}, 403)
+            return
         parts = urlparse(self.path).path.strip("/").split("/")
         if len(parts) == 3 and parts[0] == "approvals" and parts[2] in ("approve", "reject"):
             try:
@@ -267,23 +326,47 @@ def serve(port: int = DEFAULT_PORT, db_path=None) -> int:
 
 def _selftest() -> int:
     """Start the server on a temp db and port 0, hit it for real, shut it down."""
+    import http.client
     import tempfile
     import threading
     import urllib.error
     import urllib.request
 
-    def get(base: str, path: str):
+    def get(base: str, path: str) -> Any:
         with urllib.request.urlopen(base + path, timeout=10) as resp:
             assert resp.status == 200, (path, resp.status)
             ctype = resp.headers["Content-Type"]
             raw = resp.read().decode("utf-8")
         return raw if "text/html" in ctype else json.loads(raw)
 
+    # The panel page's own request shape: the non-simple header plus the browser's
+    # same-origin marker. Anything less is refused (see Handler._post_refusal).
+    PANEL_HEADERS = {"X-Wick-Panel": "1", "Sec-Fetch-Site": "same-origin"}
+
+    def raw(port: int, path: str, method: str = "POST", headers=None, body: bytes = b""):
+        """One request with full header control; returns (status, json|None)."""
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+        try:
+            conn.request(method, path, body=body, headers=headers or {})
+            resp = conn.getresponse()
+            text = resp.read().decode("utf-8")
+            return resp.status, (json.loads(text) if text else None)
+        finally:
+            conn.close()
+
     def post(base: str, path: str):
-        req = urllib.request.Request(base + path, method="POST", data=b"")
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            assert resp.status == 200, (path, resp.status)
-            return json.loads(resp.read().decode("utf-8"))
+        status, payload = raw(int(base.rsplit(":", 1)[1]), path, headers=PANEL_HEADERS)
+        assert status == 200, (path, status, payload)
+        return payload
+
+    def approval_state(db_file: Path, approval_id: int) -> tuple:
+        conn = sqlite3.connect(str(db_file))
+        try:
+            row = conn.execute("SELECT status, executed_at FROM approvals WHERE id=?",
+                               (approval_id,)).fetchone()
+        finally:
+            conn.close()
+        return row
 
     # ignore_cleanup_errors: Windows may still hold the sqlite WAL/SHM briefly.
     with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
@@ -306,6 +389,8 @@ def _selftest() -> int:
             worker_id="panel-selftest", attempts=claimed["attempts"],
         )
         assert aid is not None
+        fu_id, fu_created = db.schedule_followup(conn, "2099-01-01T09:00:00+00:00", "复查面板")
+        assert fu_id is not None and fu_created, (fu_id, fu_created)
         conn.close()
 
         server = make_server(0, path, quiet=True)
@@ -322,10 +407,16 @@ def _selftest() -> int:
             # 空态判字段、假死回收说「未接入」——两次踩过的坑就守在这两行文本上。
             assert "events_total == null" in html, "空态要判字段，不能判 {} 真假"
             assert "未接入" in html, "假死回收没有写者，要显示「未接入」"
+            # 批准按钮必须带那个非简单头，否则会被自己的 403 挡掉
+            assert '"X-Wick-Panel": "1"' in html, "页面的批准请求要带 X-Wick-Panel"
 
             events = get(base, "/events")
-            assert [e["source_id"] for e in events] == ["cmyyy/wick#6", "cmyyy/wick#5"], events
-            assert events[0]["status"] == "pending" and events[0]["attempts"] == 0, events[0]
+            assert [e["source_type"] for e in events] == ["followup", "github_issue", "github_issue"], events
+            fu = events[0]
+            assert fu["payload"]["title"] == "复查面板", fu          # 定时器事件要有自己的标题
+            assert fu["due_at"] == "2099-01-01T09:00:00+00:00", fu    # 到期时间要能渲染
+            assert events[1]["source_id"] == "cmyyy/wick#6", events[1]
+            assert events[1]["status"] == "pending" and events[1]["attempts"] == 0, events[1]
             assert len(get(base, "/events?limit=1")) == 1, "limit 参数没生效"
 
             approvals = get(base, "/approvals")
@@ -337,7 +428,7 @@ def _selftest() -> int:
             assert {d["status"] for d in deliveries} == {"sent"}, deliveries
 
             stats = get(base, "/stats")
-            assert stats["events_total"] == 2 and stats["events_failed"] == 0, stats
+            assert stats["events_total"] == 3 and stats["events_failed"] == 0, stats
             assert stats["duplicate_events"] == 1, stats            # 只有 ev_dup
             assert stats["events_with_sent_delivery"] == 2, stats
             assert stats["duplicate_rate"] == 0.5, stats            # 1/2，不是 NaN
@@ -350,16 +441,44 @@ def _selftest() -> int:
             conn.close()
             assert get(base, "/stats")["stale_requeued"] == 3, "meta 有值时应显示数字"
 
-            # 批准：只改 status，执行留给 worker
-            assert post(base, f"/approvals/{aid}/approve")["updated"] == 1
-            conn = sqlite3.connect(path)
-            conn.row_factory = sqlite3.Row
-            row = conn.execute("SELECT * FROM approvals WHERE id=?", (aid,)).fetchone()
-            conn.close()
-            assert row["status"] == "approved" and row["decided_at"], dict(row)
-            assert row["executed_at"] is None, "面板不该执行任何动作"
-            assert get(base, "/approvals") == [], "已决策的不该再出现在待批准"
-            assert post(base, f"/approvals/{aid}/approve")["updated"] == 0, "重复批准不该生效"
+            # ---- 批准闸门：跨站来源必须被拒，且库里那行不能动 ----
+            # reviewer 的原样复现：带恶意 Origin + cross-site 的 POST
+            hostile = {"Origin": "http://evil.example",
+                       "Sec-Fetch-Site": "cross-site",
+                       "X-Wick-Panel": "1"}
+            status, payload = raw(port, f"/approvals/{aid}/approve", headers=hostile, body=b"")
+            assert status == 403, (status, payload)
+            assert approval_state(path, aid)[0] == "waiting", "跨站 POST 把审批改了"
+            # 每一层单独缺失都要被拒
+            for label, headers in (
+                ("没有 X-Wick-Panel（简单请求）", {"Sec-Fetch-Site": "same-origin"}),
+                ("没有 Sec-Fetch-Site（curl 会缺）", {"X-Wick-Panel": "1"}),
+                ("Sec-Fetch-Site: same-site", {"X-Wick-Panel": "1", "Sec-Fetch-Site": "same-site"}),
+                ("Host 是 rebinding 域名", dict(PANEL_HEADERS, Host="wick.evil.example")),
+            ):
+                status, payload = raw(port, f"/approvals/{aid}/approve", headers=headers, body=b"")
+                assert status == 403, (label, status, payload)
+                assert approval_state(path, aid)[0] == "waiting", label
+            # 读也挡 rebinding：GET 带陌生 Host 直接 403
+            status, payload = raw(port, "/events", method="GET", headers={"Host": "wick.evil.example"})
+            assert status == 403, (status, payload)
+            # 带 body 的 POST 之后，同一条 keep-alive 连接上的下一个请求要能正常解析
+            conn = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+            try:
+                conn.request("POST", f"/approvals/{aid}/approve", body=b'{"pad":"' + b"x" * 200 + b'"}',
+                             headers=dict(PANEL_HEADERS, **{"Content-Type": "application/json"}))
+                first = conn.getresponse()
+                first.read()
+                conn.request("GET", "/stats")
+                second = conn.getresponse()
+                kept = json.loads(second.read().decode("utf-8"))
+            finally:
+                conn.close()
+            assert first.status == 200 and second.status == 200, (first.status, second.status)
+            assert kept["events_total"] == 3, kept
+            # 上一步已经把 aid 批准了（面板自己的合法请求）
+            assert approval_state(path, aid)[0] == "approved"
+            assert approval_state(path, aid)[1] is None, "面板不该执行任何动作"
 
             # 拒绝
             conn = db.connect(path)
@@ -368,9 +487,9 @@ def _selftest() -> int:
             assert new_id is not None
             assert post(base, f"/approvals/{new_id}/reject")["updated"] == 1
             conn = sqlite3.connect(path)
-            status = conn.execute("SELECT status FROM approvals WHERE id=?", (new_id,)).fetchone()[0]
+            status_rej = conn.execute("SELECT status FROM approvals WHERE id=?", (new_id,)).fetchone()[0]
             conn.close()
-            assert status == "rejected", status
+            assert status_rej == "rejected", status_rej
             assert post(base, "/approvals/999/reject")["updated"] == 0, "不存在的 id 不该更新"
 
             # 没有重复处理时：0，不是 NaN，也不是抛异常
@@ -391,16 +510,34 @@ def _selftest() -> int:
             assert none_sent["duplicate_rate"] == 0, none_sent
             assert "NaN" not in json.dumps(none_sent), none_sent
 
-            # 库不存在 / 表缺失：页面空块，不是报错
+            # 库不存在 / 表缺失：三块列表是 null（读不到），不是 []（队列确实是空的）
             server.db_path = Path(td) / "absent.db"
-            assert get(base, "/events") == [] and get(base, "/approvals") == [], "缺库应返回空数组"
+            assert get(base, "/events") is None, "缺库应是 null，不是 []"
+            assert get(base, "/approvals") is None and get(base, "/deliveries") is None, "缺库应是 null"
             assert get(base, "/stats") == {}, "缺库应返回空对象"
             assert not server.db_path.exists(), "读接口不该创建数据库"
+
             bare = Path(td) / "bare.db"
             sqlite3.connect(str(bare)).close()
             server.db_path = bare
-            assert get(base, "/events") == [] and get(base, "/stats") == {}, "缺表应返回空结构"
+            assert get(base, "/events") is None and get(base, "/deliveries") is None, "缺表应是 null"
+            assert get(base, "/stats") == {}, "缺表应返回空结构"
+            # 空文件上批准：只跑那一条 UPDATE，不许建表、不许开 WAL
             assert post(base, "/approvals/1/approve")["updated"] == 0, "缺表时批准不该崩"
+            conn = sqlite3.connect(str(bare))
+            tables = conn.execute("SELECT COUNT(*) FROM sqlite_master WHERE type='table'").fetchone()[0]
+            journal = conn.execute("PRAGMA journal_mode").fetchone()[0]
+            conn.close()
+            assert tables == 0, f"批准不该给空文件建表（现在 {tables} 张）"
+            assert journal != "wal", f"批准不该把空文件切成 WAL（现在 {journal}）"
+            assert not (bare.parent / (bare.name + "-wal")).exists(), "批准不该留下 -wal 文件"
+
+            # 反过来：库读得到但没有行 → []，不是 null
+            empty = Path(td) / "empty.db"
+            db.connect(empty).close()
+            server.db_path = empty
+            assert get(base, "/events") == [] and get(base, "/deliveries") == [], "空库应是 [] 不是 null"
+            assert get(base, "/approvals") == [], "没有待批准应是 [] 不是 null"
 
             # 未知路径
             try:
@@ -414,8 +551,9 @@ def _selftest() -> int:
             thread.join(timeout=10)
             assert not thread.is_alive(), "服务没关掉"
 
-    print("server.py selftest OK: 五个 GET 真库读数 / 批准只改 status 且 executed_at 仍 NULL / "
-          "重复处理率 0 不是 NaN / 假死回收未接入 / 缺库缺表返回空结构 / 关得掉")
+    print("server.py selftest OK: 五个 GET 真库读数 / 跨站 POST 403 且库不变 / 批准只改 status 且 "
+          "executed_at 仍 NULL / 空文件批准不建表不开 WAL / 带 body 的 POST 不打乱 keep-alive / "
+          "重复处理率 0 不是 NaN / 假死回收未接入 / 缺库缺表返 null、空库返 [] / 定时器事件带标题与 due_at / 关得掉")
     return 0
 
 

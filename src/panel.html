@@ -173,15 +173,33 @@
     }, "没有待批准的请求"));
   }
 
+  // due_at 在将来 → 「预定 11-23 09:00」。否则「排在未来」和「该跑没人跑」长得一模一样。
+  function dueLabel(due) {
+    if (!due) return null;
+    var ts = Date.parse(due);
+    if (isNaN(ts) || ts <= Date.now()) return null;
+    var d = new Date(ts);
+    function pad(n) { return ("0" + n).slice(-2); }
+    return "预定 " + pad(d.getMonth() + 1) + "-" + pad(d.getDate()) + " " +
+      pad(d.getHours()) + ":" + pad(d.getMinutes());
+  }
+
   function renderEvents(rows) {
     $("events-count").textContent = rows && rows.length ? " " + rows.length : "";
     var host = $("events");
     host.textContent = "";
     host.appendChild(table(["ID", "来源", "状态", "尝试", "创建时间"], rows, function (tr, e) {
       tr.appendChild(td(e.id, "num"));
-      tr.appendChild(td(e.source_type + " · " + short(e.source_id, 40)));
+      // followup 的 source_id 是 `<due_at>:<sha256>`，对人不构成信息；取 payload.title。
+      var isDue = e.source_type === "followup";
+      var source = isDue
+        ? "定时器 · " + short((e.payload && e.payload.title) || e.source_id, 40)
+        : e.source_type + " · " + short(e.source_id, 40);
+      tr.appendChild(td(source));
       var st = el("td");
-      st.appendChild(tag(e.status));
+      var due = dueLabel(e.due_at);
+      if (due) st.appendChild(el("span", due, "tag running"));
+      else st.appendChild(tag(e.status));
       tr.appendChild(st);
       tr.appendChild(td(e.attempts, "num"));
       tr.appendChild(td(when(e.created_at)));
@@ -231,14 +249,16 @@
   function decide(id, approve) {
     busy = id;
     $("note").textContent = "";
-    fetch("/approvals/" + id + (approve ? "/approve" : "/reject"), { method: "POST" })
+    // X-Wick-Panel 不是 CORS 简单头：跨站页面必须先发预检，而本服务不答 OPTIONS。
+    fetch("/approvals/" + id + (approve ? "/approve" : "/reject"),
+          { method: "POST", headers: { "X-Wick-Panel": "1" } })
       .then(function (r) { return r.ok ? r.json() : { updated: 0 }; })
       .then(function (out) {
         // 面板只改状态：真正执行要等 worker 下一轮
         if (!out.updated) $("note").textContent = "该审批已不是 waiting，刷新后不可再操作";
         else $("note").textContent = (approve ? "已批准 #" : "已拒绝 #") + id + "，等 worker 执行";
         busy = null;
-        return getJSON("/approvals").then(function (rows) { renderApprovals(rows || [], busy); });
+        return getJSON("/approvals").then(function (rows) { renderApprovals(rows, busy); });
       })
       .catch(function (err) {
         busy = null;
