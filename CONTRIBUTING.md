@@ -13,7 +13,7 @@
 派活只给三样东西，不给背景：
 
 ```bash
-hermes -p wick-dev-1 chat --in ~ -c "Bot Chat" --create-if-missing -Q -q   "实现 https://github.com/cmyyy/wick/issues/<n>。工作目录 <worktree>，分支 <branch>。只在 worktree 里改，不要 commit/push/开 PR。"
+hermes -p developer chat --in ~ -c "Bot Chat" --create-if-missing -Q -q   "实现 https://github.com/cmyyy/wick/issues/<n>。工作目录 <worktree>，分支 <branch>。只在 worktree 里改，不要 commit/push/开 PR。"
 ```
 
 三条理由，对齐 x.ai 对 Grok Bot 的设计（https://x.ai/news/designing-grok-bot）：
