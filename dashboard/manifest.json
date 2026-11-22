@@ -1,0 +1,14 @@
+{
+  "name": "wick",
+  "label": "Wick",
+  "description": "事件流 / 待批准 / 投递记录 / 健康度 —— 直接读 ~/.wick/wick.db 里的事实",
+  "icon": "Activity",
+  "version": "1.0.0",
+  "tab": {
+    "path": "/wick",
+    "position": "after:skills"
+  },
+  "slots": [],
+  "entry": "dist/index.js",
+  "api": "plugin_api.py"
+}
