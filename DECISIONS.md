@@ -23,6 +23,9 @@
 | 11 | **工期** | 10 个工作日 |
 | 12 | **开发流程** | 所有改动走 issue → branch → PR；agent 可开 PR，不可 merge |
 | 13 | **产品 vs 开发流程** | wick 是产品（五原语）；当前开发是人工编排 + bot 分工，两者未接上。自举等 D9 通过 |
+| 14 | **进度文件位置** | `~/.wick/progress/`，在仓库之外。写在 worktree 里会随 attempt 一起被销毁 |
+| 15 | **定时器只做一次性绝对时间** | 不做 cron / 时区 / 优先级；要周期就每次执行时再排一次 |
+| 16 | **派活走固定 Bot Chat** | 不用 `-z`（无记忆）、不用 `--continue`（接最近会话会错）；issue 是唯一事实源 |
 
 ---
 
@@ -140,6 +143,36 @@ D1-D5 是直接提交到 `main` 的：没有 issue 当 ticket、没有分支、�
 **收敛时机**：**D9（可靠性验收）通过之后**，把派活从 subprocess 改成写 `events` 表、结果进 `deliveries`。到那时才算自举。在那之前不许提前接。
 
 ---
+
+### 14. 为什么进度文件放在仓库之外
+
+`~/.wick/progress/`，不是 `<repo>/progress/`。
+
+#10 给每次 attempt 一块独立的 worktree，失败时整棵树连同半成品一起销毁——这正是我们要的隔离。但进度文件的作用恰好相反：它必须在 attempt 之间活下来，否则"下一轮接着上一轮"无从谈起。写进树里，它就是第一批被销毁的东西。
+
+自检里有一条断言 `PROJECT_ROOT not in path_for("x").parents`，专门盯着这件事别退化。
+
+### 15. 为什么定时器只做一次性绝对时间
+
+`due_at` 是一个具体时刻，不是规则。要周期任务，就在每次执行时再排下一次。
+
+理由：cron 表达式要引入语法、时区、"这次算不算错过"的补算语义，而 MVP 只需要"过一会儿回来做这件事"。等真出现"每小时扫一次"这种稳定需求再加，那时也知道该用哪种语义，不用此刻猜。
+
+时区一律本地时间。`due_at` 与 `db.now()` 用同一种 ISO 格式，所以字符串比较等价于时间比较——省掉一个解析器，代价是两边格式必须永远同步，代码注释里写明了。
+
+### 16. 为什么派活走固定 Bot Chat
+
+第一版是 `hermes -p <bot> -z "<超长 prompt>"`——一次性的，而且把 issue 正文、ticket、补充说明全抄进 prompt。
+
+三个后果，都实际发生过：
+
+1. **bot 没有记忆**。它不记得上一个任务的判断，只能靠 issue；而 issue 里没写的东西（比如"不要用 cron 表达式"）就永久丢了。#14 的六条设计约束当初只在 prompt 里，事后才补进 issue。
+2. **同一份事实存两处**。issue 更新后，prompt 里的旧副本成了错误信息来源。x.ai 在 Grok Bot 的设计文章里点名这是反模式：「Do not copy shared context into each Bot. That is the drift mechanism, and it fails silently.」
+3. prompt 大半是 bot 自己一条 `curl` 就能拿到的东西。
+
+改成 Hermes 原生 bot mode 的固定会话名 `Bot Chat`（见 `apps/desktop/src/plugins/hermes-bots/soul.ts`），prompt 只说三件事：issue 地址、worktree、分支。记忆跟着 bot，事实跟着 issue。
+
+`--continue` 也不用：它解析"最近一次会话"，并发或换目录会接错；`Bot Chat` 按名字定位。
 
 ## 被否决的候选（避免重复讨论）
 
