@@ -136,7 +136,7 @@ wick/
 ├── ROADMAP.md         10 个工作日排期
 ├── src/
 │   ├── db.py          三张表 schema + 去重 + due_at 定时
-│   ├── worker.py      inbox 消费者（独立进程）+ 租约 + 看门狗
+│   ├── worker.py      inbox 消费者（独立进程）+ 租约（崩溃恢复 ≤90s）
 │   ├── agent.py       一次 run：起 hermes 子进程、判定、写审批
 │   ├── sandbox.py     一次性 worktree 的创建与 diff
 │   ├── actions.py     审批通过后的真实动作（commit / push / 提 PR）
