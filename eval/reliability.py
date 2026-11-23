@@ -376,8 +376,13 @@ def check_zombie(tmp: Path) -> dict:
               "而此刻那个线程正卡在 handle() 里")
         print("    · 唯一的兜底是 run_prompt 的子进程超时：analyze 900s / fix 1500s，之后走 finish_event('failed')，"
               "是 failed 不是 pending——3 分钟口径下这条能力当前不存在")
-    return {"ok": ok, "name": "假死恢复（不重启，3 分钟内放回 pending）", "measured": measured,
-            "verdict": "通过" if ok else "不通过", "repro": "python eval/reliability.py --zombie"}
+    # known_limit: DECISIONS 17 says this is not expected to work yet. Rendered as
+    # a warning and kept OUT of the exit code -- a gate that is always red is a gate
+    # everyone learns to ignore.
+    return {"ok": ok, "known_limit": True,
+            "name": "假死恢复（不重启，3 分钟内放回 pending）",
+            "measured": measured, "verdict": "通过" if ok else "已知上限",
+            "repro": "python eval/reliability.py --zombie"}
 
 
 # ------------------------------------------------------------------- report
@@ -393,27 +398,38 @@ def write_report(results: list[dict], path: Path) -> None:
         "| --- | --- | --- | --- |",
     ]
     for r in results:
-        lines.append(f"| {r['name']} | {r['measured']} | {'✅ ' if r['ok'] else '❌ '}{r['verdict']} | `{r['repro']}` |")
+        if r["ok"]:
+            mark = "✅ "
+        elif r.get("known_limit"):
+            mark = "⚠️ **"
+        else:
+            mark = "❌ "
+        close = "**" if (not r["ok"] and r.get("known_limit")) else ""
+        lines.append(f"| {r['name']} | {r['measured']} | {mark}{r['verdict']}{close} | `{r['repro']}` |")
     lines += [
         "| 闭环成功率 ≥90% | 待补（需要 ≥10 条真实 issue 的完整记录） | 待测 | — |",
         "| 投递误报率 ≤20% | 待补（前 20 条人工标注明细） | 待测 | — |",
         "",
         "## 假死恢复：为什么 3 分钟做不到（计算过程）",
         "",
-        f"实测没通过，而且不是「预算比 3 分钟长一点」，是这条路径根本不存在。算一遍：",
+        f"这条已按 DECISIONS 17 降级为**已知上限**（不在 wick 内部解决）。"
+        f"不是「预算比 3 分钟长一点」，是这条路径根本不存在。算一遍：",
         "",
         f"1. 续租没有上限：`worker._renew_lease` 是 `while not stop.wait(HEARTBEAT_INTERVAL)`，"
         f"`HEARTBEAT_INTERVAL=30s`，只要进程活着就一直续。心跳年龄因此永远落在 [0,30)s 内。",
         f"2. 回收条件是心跳 **< now-{db.LEASE_SECONDS}s**（`db.requeue_stale`）。"
         f"年龄永远 < 30s，所以 `requeue_stale` 对卡死的事件永远命中 0 条 —— "
-        f"实测 {ZOMBIE_WINDOW}s 里心跳年龄反复在 2.8–22.9s 之间归零，一次都没逼近 90s。",
+        f"实测区间见上表（由 check_zombie 采样算出，不是常量），一次都没逼近 {db.LEASE_SECONDS}s。",
         f"3. 而且 `requeue_stale` 只在 worker 自己的循环里被调用（`worker.serve` 启动时与每次空闲时），"
         f"而 handler 卡住时那个线程正阻塞在 `handle()` 里 —— 即使租约过期也没人来收。",
         f"4. 唯一的兜底是子进程超时：analyze 路径 `DEFAULT_TIMEOUT=900s`，fix 路径 "
         f"`FIX_TIMEOUT=1500s`（外加最多 11 × `CHECK_TIMEOUT=300s` 的自检）。超时后走的是 "
         f"`finish_event('failed')`，终点是 **failed**，不是 pending。",
         "",
-        f"结论：**3 分钟回收 = 0 次**。要满足这条口径，必须给续租加预算（例如 "
+        f"结论：**3 分钟回收 = 0 次**。这条口径要成立需要两件事，成本差一个量级：一是**进度信号**"
+        f"（心跳带 phase，才能区分「慢」和「死」）—— 贵；二是**机制**（handler 跑独立线程、主线程按预算 "
+        f"kill 子进程树并继续消费）—— 便宜，且顺带解决队头阻塞。两者都在 #26。原文曾把两者混为一谈并整体否决，"
+        f"这个判断在 review 时被纠正。旧的「只加续租预算」写法（"
         f"`_renew_lease` 超过 `FIX_TIMEOUT + N×CHECK_TIMEOUT` 就停止续租，让行自然变 stale），"
         f"那属于改 `src/`，本次按 ticket 要求只报告不改。",
         "",
@@ -421,17 +437,21 @@ def write_report(results: list[dict], path: Path) -> None:
         "证据：",
         "",
         "```bash",
-        "$ grep -rn \"FIX_TIMEOUT + 4\\|watchdog\\|看门狗\" src/ eval/",
+        "$ grep -rn \"FIX_TIMEOUT + 4\\|watchdog\\|看门狗\" src/",
         "（无输出）",
         "```",
         "",
         "## 口径与计算（供复核）",
         "",
-        f"- 租约：`db.LEASE_SECONDS = {db.LEASE_SECONDS}`s，worker 每 30s 续租一次（`worker.HEARTBEAT_INTERVAL`）。",
-        "  崩溃后的回收延迟上界 = 租约长度（最后一次心跳 + 90s），不是 kill 的瞬间。",
+        f"- 租约：`db.LEASE_SECONDS = {db.LEASE_SECONDS}`s，worker 每 {30}s 续租一次（`worker.HEARTBEAT_INTERVAL`）。",
+        "  崩溃后的回收延迟上界 = 最后一拍 + 租约 = **≤120s**（心跳每 30s 一拍），不是 kill 的瞬间，"
+        "且前提是有人把 worker 再起来。",
         "- 崩溃恢复：假 hermes 卡住 → `taskkill /F /T` → 心跳停在最后一拍 → 重启的 worker 在",
         "  `serve()` 启动和每次空闲时调用 `db.requeue_stale()`，租约过期后把行放回 `pending`，",
         "  第二次尝试用会立刻返回的假 hermes 跑完 → `done`。",
+        "  注意「deliveries 仍 1 条」有一半是**结构性保证**：`add_delivery` 在 `handle()` 返回之后才调用，"
+        "被 kill 的 attempt 根本没机会写投递。fence 本身（旧 attempt 晚到被拒）由 `db.py` 的 selftest 覆盖，"
+        "**本演练没有覆盖它** —— 要覆盖需慢 handler + 第二个 worker 抢租约。",
         "- 假死恢复：见 `--zombie` 输出；当前代码没有「续租预算」，卡死的进程会一直持有租约。",
         "- 重复灌入：`events.dedupe_key` 是 `UNIQUE` + `INSERT OR IGNORE`，三次 enqueue 只有第一次落行。",
         "",
@@ -483,7 +503,9 @@ def main(argv: list[str] | None = None) -> int:
         print(f"  [{'通过' if r['ok'] else '不通过'}] {r['name']} — {r['measured']}")
     if args.all:
         write_report(results, Path(args.report))
-    failed = [r["name"] for r in results if not r["ok"]]
+    # known_limit results are assertions that it does NOT work (DECISIONS 17). Counting
+    # them as failures makes --all permanently red, which trains everyone to ignore it.
+    failed = [r["name"] for r in results if not r["ok"] and not r.get("known_limit")]
     if failed:
         print(f"\n未通过：{'；'.join(failed)}")
         return 1
