@@ -54,11 +54,13 @@ hermes -p developer chat --in ~ -c "Bot Chat" --create-if-missing -Q -q   "实�
 |---|---|---|
 | 「那个 key 在全仓任何分支都没有写者」 | 当时确实没有；#25 合入之后有了（`src/db.py:42`） | `git log --all -S"stats:stale_requeued"` |
 | 「预算 = `FIX_TIMEOUT + 4×CHECK_TIMEOUT`」 | 代码里没有这个预算 | `grep -rn "FIX_TIMEOUT + 4" src/` |
-| 「心跳反复在 2.8–22.9s 之间」 | 手打进生成器的常量，不是采样 | `git log -p 1c16af2 -- eval/reliability.py` |
-| 「wick 内部不恢复」 | 子进程超时转 `failed`（fix 最坏 1500s + 11×`CHECK_TIMEOUT`）；重排要人手动 `cli.py retry` | `grep -n "FIX_TIMEOUT\|CHECK_TIMEOUT" src/agent.py` |
+| 「心跳反复在 2.8–22.9s 之间」 | 手打进生成器的常量，不是采样 | `git show f348439:eval/reliability.py \| grep 22.9` |
+| 「wick 内部不恢复」 | 子进程超时转 `failed`（fix 最坏 1500s + 11×`CHECK_TIMEOUT`）；重排要人手动 `cli.py retry` | `grep -n "timeout=FIX_TIMEOUT" -A6 src/agent.py` 看超时后面调的是哪个 `finish_event` |
 | 「手改 `report.md` 会被抓」 | 当时的检查只比判定列，改数字和改正文全放过 | `git log -p abe3730 -- eval/check-report.py` |
 
 写这类句子时，**先把第三列跑一遍**。跑不出所示输出的，句子就还没到能写的程度。
+
+第 2、5 行的第三列是「证明它不存在」的命令 —— `grep` 返回 exit 1、输出为空，那正是证据本身，不是命令坏了。其余三行要有输出才算数。
 
 ### 每一轮改动都派 reviewer
 
