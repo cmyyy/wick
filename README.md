@@ -116,10 +116,12 @@ GitHub 上已经有 5 个同赛道项目（都叫 nightshift），它们解决�
 
 | 段 | 判据 | 谁做 |
 |---|---|---|
-| **1. 产出** | run 结束、`approvals` 里多一行 `status='waiting'`、自检全绿（worker 实跑，非 agent 自报） | wick |
+| **1. 产出** | run 结束、`approvals` 里**多出一行**（判「存在」，不判它的状态）、自检全绿（worker 实跑，非 agent 自报） | wick |
 | **2. 落地** | 人批准后 `executed_at` 非空 **且** `detail.execution_error` 为空，**且** `deliveries` 里有一条带 PR URL 的行 | 人 → `process_approvals` |
 
 > 为什么必须分两段：`handle_issue_fix` 的 docstring 写得很清楚——「A green suite is evidence, not permission: this never commits, pushes or opens a PR」。一次 run 只写 `waiting` 行，PR 是批准后 `process_approvals`（`db.py:366` 只捞 `status='approved' AND executed_at IS NULL`）才开。所以「PR 已开」和「行还 waiting」在同一时刻不可能同时成立——**两段是串联的，不是互斥的选项**，写成三条同时成立会让自动判据恒为 0。
+>
+> a 段为什么不能写 `status='waiting'`：b 段成功之后，那一行已经变成 `approved`。照字面写进 SQL，会把成功的那条判成没过 a 段——**又是一次恒为 0**。判「这一行存在」就够了，因为 `agent.py:355` 的 `if not checks["all_ok"]: raise` 在 `request_approval`（`:360`）之前，所以**行存在 ≡ 自检全绿**，不必去解析 `checks` 里的 "12/12" 字符串。
 >
 > b 段为什么不能只看 `executed_at`：`mark_executed` 在**执行失败时也写它**（`db.py:372-377`，同时把错误塞进 `detail.execution_error`）。所以只看非空会把失败算成成功，必须加 `execution_error` 为空。PR URL 只进 `deliveries` 文本（`worker.py:129-131`），没有列可查，所以第三项要查 `deliveries` 的行。
 
@@ -133,7 +135,27 @@ GitHub 上已经有 5 个同赛道项目（都叫 nightshift），它们解决�
 
 **样本**：4–6 条真实 issue（reviewer 发现的缺陷 + 现有真实缺口），**由 wick 的 worker 自己跑**，不是人工修。具体哪几条等 #30 定。
 
+**空库怎么写**：`COUNT` 都是 0 时比率是 NULL（SQLite 的 0/0），不是 0%。**只能写 `0/0`，写 0% 是假的**。
+
 **样本门槛**：n≥4 就报 n/N。要写百分比至少 n≥36 —— n/n 全通过的 95% 下界在 n=36 时才到 0.9026（n=28 是 0.8766）。写百分比时同时写 n 和下界。
+
+**判定用的查询**（在真库上造 7 种终态验过：停在 a、b 成功、拒执行、执行异常、run 失败、人 reject、只读分析 → 返回 `1/7`）：
+
+```sql
+SELECT
+  (SELECT COUNT(DISTINCT e.id) FROM events e
+     JOIN approvals a ON a.event_id = e.id
+    WHERE e.source_id IN (<样本>)        -- 手动列出那 4-6 条
+      AND a.decided_at IS NOT NULL       -- a 段：行存在
+      AND a.executed_at IS NOT NULL      -- b 段：执行过
+      AND json_extract(a.detail,'$.execution_error') IS NULL   -- 且没失败
+      AND EXISTS (SELECT 1 FROM deliveries d
+                   WHERE d.event_id = e.id AND d.body LIKE '%已提 PR：http%'))
+  || '/' ||
+  (SELECT COUNT(*) FROM events e WHERE e.source_id IN (<样本>));
+```
+
+三个 b 段条件是**冗余的三重保险**，不是三道必需的门。`worker.py:112-131` 的三条路径写不同文案：成功写 `已提 PR：url`、拒执行写 `审批 #N 未执行`、执行异常写 `批准的动作执行失败`。所以任意两个条件都能判对；全写上是因为它们各自能扛住一种文案改动。实测：去掉 `execution_error` 那条，结果仍是 `1/7`（`deliveries` 的 URL 条件已经挡住了两条失败）。
 
 **为什么先报 n/N 而不写 ≥90%**：4/4 全通过的 95% 置信区间约 40%–100%（`awk 'BEGIN{printf "%.4f", exp(log(0.025)/4)}'` → 0.3976，Clopper-Pearson 下界），宣称 ≥90% 是过度解读。样本够了再写百分比。
 
