@@ -117,15 +117,23 @@ GitHub 上已经有 5 个同赛道项目（都叫 nightshift），它们解决�
 | 段 | 判据 | 谁做 |
 |---|---|---|
 | **1. 产出** | run 结束、`approvals` 里多一行 `status='waiting'`、自检全绿（worker 实跑，非 agent 自报） | wick |
-| **2. 落地** | 人批准后 `executed_at` 非空，且 PR 真的开出来了（`open_pr` 成功） | 人 → `process_approvals` |
+| **2. 落地** | 人批准后 `executed_at` 非空 **且** `detail.execution_error` 为空，**且** `deliveries` 里有一条带 PR URL 的行 | 人 → `process_approvals` |
 
-> 为什么必须分两段：`handle_issue_fix` 的 docstring 写得很清楚——「A green suite is evidence, not permission: this never commits, pushes or opens a PR」。所以「PR 已开」和「行还 waiting」互斥，把三条写成同时成立会让自动判据恒为 0。
+> 为什么必须分两段：`handle_issue_fix` 的 docstring 写得很清楚——「A green suite is evidence, not permission: this never commits, pushes or opens a PR」。一次 run 只写 `waiting` 行，PR 是批准后 `process_approvals`（`db.py:366` 只捞 `status='approved' AND executed_at IS NULL`）才开。所以「PR 已开」和「行还 waiting」在同一时刻不可能同时成立——**两段是串联的，不是互斥的选项**，写成三条同时成立会让自动判据恒为 0。
+>
+> b 段为什么不能只看 `executed_at`：`mark_executed` 在**执行失败时也写它**（`db.py:372-377`，同时把错误塞进 `detail.execution_error`）。所以只看非空会把失败算成成功，必须加 `execution_error` 为空。PR URL 只进 `deliveries` 文本（`worker.py:129-131`），没有列可查，所以第三项要查 `deliveries` 的行。
+
+**分子钉死**：**闭环成功率 = a 和 b 都成功的条数 / 总条数**。只到 a（wick 干完、没人批）算失败——按「不人工干预」的口径，等人批不算介入，但如果一直没人批，这条就永远停在 a。
+
+**只读分析不进样本**：它的 `checks` 是「—（只读分析，未改代码）」（`agent.py:296`），永远过不了 a 段。样本必须是走 fix 路径（改代码 + 跑自检）的 issue。
 
 **判定方式**：自动判据筛上面两条，人用面板 approve 按钮触发第二段。
 
 **人工介入的边界**：wick **没有自动重试**——失败即 `failed` 终态，重排要人跑 `cli.py retry`（`src/cli.py:113` 自称「The only retry the system has」）。所以按「不人工干预」的口径，**需要人跑 retry 的算失败**；**人手动解冲突也算失败**。
 
 **样本**：4–6 条真实 issue（reviewer 发现的缺陷 + 现有真实缺口），**由 wick 的 worker 自己跑**，不是人工修。具体哪几条等 #30 定。
+
+**样本门槛**：n≥4 就报 n/N。要写百分比至少 n≥36 —— n/n 全通过的 95% 下界在 n=36 时才到 0.9026（n=28 是 0.8766）。写百分比时同时写 n 和下界。
 
 **为什么先报 n/N 而不写 ≥90%**：4/4 全通过的 95% 置信区间约 40%–100%（`awk 'BEGIN{printf "%.4f", exp(log(0.025)/4)}'` → 0.3976，Clopper-Pearson 下界），宣称 ≥90% 是过度解读。样本够了再写百分比。
 
@@ -151,7 +159,7 @@ GitHub 上已经有 5 个同赛道项目（都叫 nightshift），它们解决�
 ```
 wick/
 ├── README.md          项目门面（本文件）
-├── DECISIONS.md       13 条关键决策 + 理由（防止后面改主意）
+├── DECISIONS.md       18 条关键决策 + 理由（防止后面改主意）
 ├── ROADMAP.md         10 个工作日排期
 ├── src/
 │   ├── db.py          三张表 schema + 去重 + due_at 定时

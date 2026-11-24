@@ -407,8 +407,9 @@ def write_report(results: list[dict], path: Path) -> None:
         close = "**" if (not r["ok"] and r.get("known_limit")) else ""
         lines.append(f"| {r['name']} | {r['measured']} | {mark}{r['verdict']}{close} | `{r['repro']}` |")
     lines += [
-        "| 闭环成功率 | 待测：n/0 ｜两段 = (a) run 产出 waiting approval + 自检全绿，"
-        "(b) 人批准后 executed_at 非空且 PR 开出；无自动重试，需 retry 或人解冲突都算失败（issue #29） | 待测 | — |",
+        "| 闭环成功率 | 待测：n/0 ｜a 段 = waiting approval + 自检全绿（worker 实跑）；"
+        "b 段 = 批准后 executed_at 非空且 detail.execution_error 为空且 deliveries 有 PR URL；"
+        "分子 = a 且 b 都成功；只读分析不进样本；无自动重试（定义见 README，issue #29） | 待测 | — |",
         "| 投递误报率 ≤20% | 待补（前 20 条人工标注明细） | 待测 | — |",
         "",
         "## 假死恢复：为什么 3 分钟做不到（计算过程）",
