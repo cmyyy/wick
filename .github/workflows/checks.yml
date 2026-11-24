@@ -8,24 +8,16 @@ on:
 jobs:
   selftest:
     runs-on: ubuntu-latest
+    # Default is six hours. This repo just spent a round on "a handler that hangs
+    # forever", so a hanging job here is not hypothetical.
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
-      # Fourteen seconds, no dependencies, no network. Cheap enough that there
-      # is no reason for this to depend on anyone remembering to run it.
+      # One command, fourteen seconds, no dependencies, no network. The list lives
+      # in src/agent.py's CHECKS so this file never has to be edited to add a check.
       - name: Self-checks
-        run: |
-          python src/db.py
-          python src/worker.py --selftest
-          python src/sources/github.py
-          python src/agent.py
-          python src/sandbox.py
-          python src/actions.py
-          python src/progress.py
-          python src/cli.py selftest
-          python src/outbox.py
-          python src/server.py --selftest
-          python eval/run.py --selftest
+        run: python src/agent.py --checks

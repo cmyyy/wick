@@ -132,9 +132,12 @@ python src/cli.py selftest
 python src/outbox.py
 python eval/run.py --selftest
 python src/server.py --selftest
+python eval/check-report.py --selftest
 ```
 
-十一个全绿再提（CI 也会在 PR 上跑同一份清单，见下文）。新增模块时把它的自检加进这份清单，`src/agent.py` 里的 `CHECKS` 也要同步——那是 worker 跑 agent 改动后实际执行的门槛，不同步等于新模块坏了没人管。
+清单的**唯一事实源**是 `src/agent.py` 里的 `CHECKS`——`python src/agent.py --checks` 跑的就是它，CI 也调这一条。上面的列表是给人读的，改了 `CHECKS` 它会跟着变，不用手工同步三处。
+
+十二个全绿再提（CI 跑的也是这一份，见下文）。新增模块时把它的自检加进这份清单，`src/agent.py` 里的 `CHECKS` 也要同步——那是 worker 跑 agent 改动后实际执行的门槛，不同步等于新模块坏了没人管。
 
 ## 可靠性验收（改动了 worker / db / outbox 才跑）
 
@@ -162,15 +165,22 @@ python eval/check-report.py --selftest # 1 秒：只验解析器本身
 - 改动了 `eval/report.md`（本来就不该改 —— 跑了就知道）
 - 改动了 `src/` 里影响可靠性结论的东西（worker 租约、`db.requeue_stale`、`outbox` 投递）
 
-它**故意忽略**时间戳和心跳采样区间（每次跑都会变），比对的是「有哪些验收项 + 每项的判定」。
+比对的是**整份文件逐字**，只把两样东西按设计打码：时间戳那一行，和心跳采样区间（`2.4–22.5s` 这种，每次跑都不同）。所以改了判定、改了实测数字、改了正文的一句话，都会红。
 
-> 为什么单列一节：这条规矩来自一次真实的错。生成的报告里有一句「心跳年龄反复在 2.8–22.9s 之间」，那个区间是手打进生成器字符串的，不是采样出来的 —— 它和同一页表格里的数字对不上，任何人重跑一次就会发现。生成物和它的生成器只允许有一个事实源。
+> 为什么单列一节：这条规矩来自一次真实的错。生成的报告里有一句「心跳年龄反复在 2.8–22.9s 之间」，那个区间是手打进生成器字符串的，不是采样出来的 —— 它和同一页表格里的数字对不上。
+>
+> 注意这个检查**抓不到这一类**：手写的区间如果正好长成「N–Ms」，会被当成易变部分打码放过。那一条靠的是生成器只印一次、且印的是真采样值，不靠事后比对。检查的边界写在这里，免得下一个人以为它管得更宽。
 
 ## 自动跑的部分
 
 `.github/workflows/checks.yml` 在 PR 上跑那 11 个自检（14 秒，无依赖、无网络）。不需要谁记得跑。
 
-**没进 CI 的**：`eval/reliability.py --all`（约 6 分钟、要真起进程并 kill 子进程）。它属于「改动上面那几处才跑」的本机检查，用 `check-report.py` 触发。
+**没进 CI 的两个**：
+
+- `eval/reliability.py --all` —— 约 6 分钟，要真起进程并 kill 子进程
+- `eval/check-report.py`（不带 `--selftest`）—— 它跑前者，而且**依赖 Windows 的 `taskkill /F /T`**（`--crash` 那一条用它制造真崩溃）。所以它注定进不了 ubuntu runner，不要试图塞进去
+
+两者都属于「改动了那几处才跑」的本机检查。
 
 ## PR 要求
 

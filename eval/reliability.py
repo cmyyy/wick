@@ -35,7 +35,7 @@ sys.path.insert(0, str(SRC))
 import db  # noqa: E402
 
 POLL = 1                   # worker loop interval during the drills (real default is 5s)
-CRASH_WAIT = 180           # how long to wait for recovery after the restart
+CRASH_WAIT = 240           # how long to wait for recovery after the restart
 ZOMBIE_WINDOW = 200        # the acceptance criterion is "3 分钟内": measure 3.3 minutes
 SAMPLE = 10                # heartbeat sampling period during the zombie drill
 

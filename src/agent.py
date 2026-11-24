@@ -50,6 +50,7 @@ CHECKS = [
     ["src/outbox.py"],
     ["eval/run.py", "--selftest"],
     ["src/server.py", "--selftest"],
+    ["eval/check-report.py", "--selftest"],
 ]
 
 VERDICTS_FIX = ("已修复", "部分修复", "无法修复")
@@ -629,11 +630,13 @@ def _selftest() -> int:
         (wt / "src").mkdir()
         (wt / "eval").mkdir()
         good = "print('ok')\n"
-        for rel in ("src/db.py", "src/worker.py", "src/sources/github.py", "src/agent.py",
-                    "src/sandbox.py", "src/actions.py", "src/progress.py", "src/cli.py",
-                    "src/outbox.py", "src/server.py", "eval/run.py"):
-            (wt / rel).parent.mkdir(parents=True, exist_ok=True)
-            (wt / rel).write_text(good, encoding="utf-8")
+        # Derive the stubs from CHECKS. A hardcoded copy of the list is exactly how
+        # this broke the first time: the twelfth check had no stub here, so the
+        # runner reported a failure that said nothing about the worktree.
+        for args in CHECKS:
+            stub = wt / args[0]
+            stub.parent.mkdir(parents=True, exist_ok=True)
+            stub.write_text(good, encoding="utf-8")
         checks = run_checks(wt)
         total = len(CHECKS)
         assert checks["all_ok"] and checks["passed"] == total, checks
@@ -649,4 +652,17 @@ def _selftest() -> int:
 
 
 if __name__ == "__main__":
+    if "--checks" in sys.argv:
+        # The single source of truth for the check list. CI runs this one command,
+        # so adding a check to CHECKS above picks it up everywhere without editing
+        # the workflow -- three copies of the list drifted apart once already.
+        root = Path(__file__).resolve().parent.parent
+        result = run_checks(root)
+        for r in result["results"]:
+            print(f"  {'OK  ' if r['ok'] else 'FAIL'} {r['cmd']}")
+            if not r["ok"]:
+                for line in r["tail"]:
+                    print(f"       {line}")
+        print(f"{result['passed']}/{result['total']} 通过")
+        raise SystemExit(0 if result["all_ok"] else 1)
     raise SystemExit(_selftest())
