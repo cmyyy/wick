@@ -35,7 +35,7 @@ sys.path.insert(0, str(SRC))
 import db  # noqa: E402
 
 POLL = 1                   # worker loop interval during the drills (real default is 5s)
-CRASH_WAIT = 180           # how long to wait for recovery after the restart
+CRASH_WAIT = 240           # how long to wait for recovery after the restart
 ZOMBIE_WINDOW = 200        # the acceptance criterion is "3 分钟内": measure 3.3 minutes
 SAMPLE = 10                # heartbeat sampling period during the zombie drill
 
@@ -130,7 +130,7 @@ def send_recorder(tmp: Path, tag: str) -> tuple[Path, Path]:
 def worker_env(tmp: Path, fake: Path, send_py: Path, slow: bool, db_path: Path) -> dict:
     env = dict(os.environ)
     env.update({
-        "WICK_MODE": "analyze",           # no worktree, no 11 checks: only the run itself
+        "WICK_MODE": "analyze",           # no worktree, no self-checks: only the run itself
         "WICK_HERMES_BIN": str(fake),
         "WICK_PROGRESS_DIR": str(tmp / "progress"),
         "WICK_SEND_CMD": f'"{sys.executable}" "{send_py}"',

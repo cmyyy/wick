@@ -33,7 +33,7 @@ hermes -p developer chat --in ~ -c "Bot Chat" --create-if-missing -Q -q   "实�
 
 **合格**：
 - 「浏览器里四块都渲染了、点批准该行消失，库里 `executed_at` 仍是 NULL」
-- 「真子进程 + 真端口 + 真库，十一个自检全绿，三处变异都红」
+- 「真子进程 + 真端口 + 真库，十二个自检全绿，三处变异都红」
 
 **不合格**：
 - 「插件被发现了」—— 哪个发现？进程内调函数，还是服务里真扫到？
@@ -132,9 +132,12 @@ python src/cli.py selftest
 python src/outbox.py
 python eval/run.py --selftest
 python src/server.py --selftest
+python eval/check-report.py --selftest
 ```
 
-十一个全绿再提。新增模块时把它的自检加进这份清单，`src/agent.py` 里的 `CHECKS` 也要同步——那是 worker 跑 agent 改动后实际执行的门槛，不同步等于新模块坏了没人管。
+**代码层只有一个事实源**：`src/agent.py` 里的 `CHECKS`。`python src/agent.py --checks` 跑的就是它，CI 调的也是这一条，所以往 `CHECKS` 里加一项，CI 和 worker 的门槛都会跟着走。
+
+**上面的列表是给人读的，CI 不读它，改 `CHECKS` 它也不会自动变**——要手工跟一次。这句话上一版写成"不用手工同步"，那是假的：`README` 里曾有一份十条的副本落后了两条没人发现，就是这个代价。所以：**加自检 = 改 `CHECKS`（必须）+ 顺手改这份列表（给下一个人看）。**
 
 ## 可靠性验收（改动了 worker / db / outbox 才跑）
 
@@ -146,6 +149,38 @@ python eval/reliability.py --all      # 全跑，任一不通过就非零退出
 ```
 
 这三条是**真进程、真库、真 skill**，不是 mock：`--crash` 会真起 worker 再 `taskkill /F`。所以它们比自检慢得多，只在动到 `worker.py` / `db.py` / `outbox.py` / `agent.py` 的租约或投递逻辑时跑。每条判定后面都跟着产生它的 SQL。
+
+## 生成物不要手改
+
+`eval/report.md` 是 `python eval/reliability.py --all` 的输出，它的判定列由脚本算出来。手改它会被抓出来：
+
+```bash
+python eval/check-report.py            # 约 6 分钟：重跑 --all 到临时路径，比对判定列
+python eval/check-report.py --selftest # 1 秒：只验解析器本身
+```
+
+什么时候跑：
+
+- 改动了 `eval/reliability.py` 的判定逻辑或报告生成
+- 改动了 `eval/report.md`（本来就不该改 —— 跑了就知道）
+- 改动了 `src/` 里影响可靠性结论的东西（worker 租约、`db.requeue_stale`、`outbox` 投递）
+
+比对的是**整份文件逐字**，只把两样东西按设计打码：时间戳那一行，和心跳采样区间（`2.4–22.5s` 这种，每次跑都不同）。所以改了判定、改了实测数字、改了正文的一句话，都会红。
+
+> 为什么单列一节：这条规矩来自一次真实的错。生成的报告里有一句「心跳年龄反复在 2.8–22.9s 之间」，那个区间是手打进生成器字符串的，不是采样出来的 —— 它和同一页表格里的数字对不上。
+>
+> 注意这个检查**抓不到这一类**：手写的区间如果正好长成「N–Ms」，会被当成易变部分打码放过。那一条靠的是生成器只印一次、且印的是真采样值，不靠事后比对。检查的边界写在这里，免得下一个人以为它管得更宽。
+
+## 自动跑的部分
+
+`.github/workflows/checks.yml` 在 PR 上跑全部自检（14 秒，无依赖、无网络）。不需要谁记得跑。
+
+**没进 CI 的两个**：
+
+- `eval/reliability.py --all` —— 约 6 分钟，要真起进程并 kill 子进程
+- `eval/check-report.py`（不带 `--selftest`）—— 它跑前者，而且**依赖 Windows 的 `taskkill /F /T`**（`--crash` 那一条用它制造真崩溃）。所以它注定进不了 ubuntu runner，不要试图塞进去
+
+两者都属于「改动了那几处才跑」的本机检查。
 
 ## PR 要求
 
