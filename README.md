@@ -106,9 +106,58 @@ GitHub 上已经有 5 个同赛道项目（都叫 nightshift），它们解决�
 
 | 指标 | 定义 | 目标 |
 |---|---|---|
-| **闭环成功率** | 一条 issue 进来，不人工干预能否产出"可批准的结果" | ≥ 90% |
+| **闭环成功率** | 一条 issue 进来，不人工干预能否产出「可批准的结果」——定义见下 | 先报 n/N，样本够之前不写百分比 |
 | **重复处理率** | 同一条 issue 被处理两次的比例 | **0**（硬红线） |
 | **投递误报率** | 它认为该做、你认为不该做的比例 | ≤ 20%（前 20 条人工标注） |
+
+**「可批准的结果」的定义**（2026-11-24 定，见 issue #29）：
+
+一次 run 走完**两段**才算一个闭环，两段不会同时发生：
+
+| 段 | 判据 | 谁做 |
+|---|---|---|
+| **1. 产出** | run 结束、`approvals` 里**多出一行**（判「存在」，不判它的状态）、自检全绿（worker 实跑，非 agent 自报） | wick |
+| **2. 落地** | 人批准后 `executed_at` 非空 **且** `detail.execution_error` 为空，**且** `deliveries` 里有一条带 PR URL 的行 | 人 → `process_approvals` |
+
+> 为什么必须分两段：`handle_issue_fix` 的 docstring 写得很清楚——「A green suite is evidence, not permission: this never commits, pushes or opens a PR」。一次 run 只写 `waiting` 行，PR 是批准后 `process_approvals`（`db.py:366` 只捞 `status='approved' AND executed_at IS NULL`）才开。所以「PR 已开」和「行还 waiting」在同一时刻不可能同时成立——**两段是串联的，不是互斥的选项**，写成三条同时成立会让自动判据恒为 0。
+>
+> a 段为什么不能写 `status='waiting'`：b 段成功之后，那一行已经变成 `approved`。照字面写进 SQL，会把成功的那条判成没过 a 段——**又是一次恒为 0**。判「这一行存在」就够了，因为 `agent.py:355` 的 `if not checks["all_ok"]: raise` 在 `request_approval`（`:360`）之前，所以**行存在 ≡ 自检全绿**，不必去解析 `checks` 里的 "12/12" 字符串。
+>
+> b 段为什么不能只看 `executed_at`：`mark_executed` 在**执行失败时也写它**（`db.py:372-377`，同时把错误塞进 `detail.execution_error`）。所以只看非空会把失败算成成功，必须加 `execution_error` 为空。PR URL 只进 `deliveries` 文本（`worker.py:129-131`），没有列可查，所以第三项要查 `deliveries` 的行。
+
+**分子钉死**：**闭环成功率 = a 和 b 都成功的条数 / 总条数**。只到 a（wick 干完、没人批）算失败——按「不人工干预」的口径，等人批不算介入，但如果一直没人批，这条就永远停在 a。
+
+**只读分析不进样本**：它的 `checks` 是「—（只读分析，未改代码）」（`agent.py:296`），永远过不了 a 段。样本必须是走 fix 路径（改代码 + 跑自检）的 issue。
+
+**判定方式**：自动判据筛上面两条，人用面板 approve 按钮触发第二段。
+
+**人工介入的边界**：wick **没有自动重试**——失败即 `failed` 终态，重排要人跑 `cli.py retry`（`src/cli.py:113` 自称「The only retry the system has」）。所以按「不人工干预」的口径，**需要人跑 retry 的算失败**；**人手动解冲突也算失败**。
+
+**样本**：4–6 条真实 issue（reviewer 发现的缺陷 + 现有真实缺口），**由 wick 的 worker 自己跑**，不是人工修。具体哪几条等 #30 定。
+
+**空库怎么写**：`COUNT` 都是 0 时比率是 NULL（SQLite 的 0/0），不是 0%。**只能写 `0/0`，写 0% 是假的**。
+
+**样本门槛**：n≥4 就报 n/N。要写百分比至少 n≥36 —— n/n 全通过的 95% 下界在 n=36 时才到 0.9026（n=28 是 0.8766）。写百分比时同时写 n 和下界。
+
+**判定用的查询**（在真库上造 7 种终态验过：停在 a、b 成功、拒执行、执行异常、run 失败、人 reject、只读分析 → 返回 `1/7`）：
+
+```sql
+SELECT
+  (SELECT COUNT(DISTINCT e.id) FROM events e
+     JOIN approvals a ON a.event_id = e.id
+    WHERE e.source_id IN (<样本>)        -- 手动列出那 4-6 条
+      AND a.decided_at IS NOT NULL       -- a 段：行存在
+      AND a.executed_at IS NOT NULL      -- b 段：执行过
+      AND json_extract(a.detail,'$.execution_error') IS NULL   -- 且没失败
+      AND EXISTS (SELECT 1 FROM deliveries d
+                   WHERE d.event_id = e.id AND d.body LIKE '%已提 PR：http%'))
+  || '/' ||
+  (SELECT COUNT(*) FROM events e WHERE e.source_id IN (<样本>));
+```
+
+三个 b 段条件是**冗余的三重保险**，不是三道必需的门。`worker.py:112-131` 的三条路径写不同文案：成功写 `已提 PR：url`、拒执行写 `审批 #N 未执行`、执行异常写 `批准的动作执行失败`。所以任意两个条件都能判对；全写上是因为它们各自能扛住一种文案改动。实测：去掉 `execution_error` 那条，结果仍是 `1/7`（`deliveries` 的 URL 条件已经挡住了两条失败）。
+
+**为什么先报 n/N 而不写 ≥90%**：4/4 全通过的 95% 置信区间约 40%–100%（`awk 'BEGIN{printf "%.4f", exp(log(0.025)/4)}'` → 0.3976，Clopper-Pearson 下界），宣称 ≥90% 是过度解读。样本够了再写百分比。
 
 外加三条可靠性验收：崩溃恢复（kill worker 后同一条事件能重跑、不重复投递）、去重（同一事件灌两次只处理一次）、节流（超限自动压到次日）。
 
@@ -132,7 +181,7 @@ GitHub 上已经有 5 个同赛道项目（都叫 nightshift），它们解决�
 ```
 wick/
 ├── README.md          项目门面（本文件）
-├── DECISIONS.md       13 条关键决策 + 理由（防止后面改主意）
+├── DECISIONS.md       18 条关键决策 + 理由（防止后面改主意）
 ├── ROADMAP.md         10 个工作日排期
 ├── src/
 │   ├── db.py          三张表 schema + 去重 + due_at 定时

@@ -27,6 +27,7 @@
 | 15 | **定时器只做一次性绝对时间** | 不做 cron / 时区 / 优先级；要周期就每次执行时再排一次 |
 | 16 | **派活走固定 Bot Chat** | 不用 `-z`（无记忆）、不用 `--continue`（接最近会话会错）；issue 是唯一事实源 |
 | 17 | **降级的是「3 分钟」，不是整个机制** | 「3 分钟」区分不了「慢」和「死」（要进度信号），口径降级为已知上限；但「独立线程 + 超时 kill + attempts 上限」很便宜，作为 #26 第一步 |
+| 18 | **闭环 = 两段串联，不是一次 run** | a 段：run 产出 `waiting` approval + 自检绿；b 段：人批准后 `executed_at` 非空 **且 `detail.execution_error` 为空** 且 `deliveries` 有 PR URL 行。两段在同一时刻不可能同时成立（互斥），所以必须串联判，写成一次 run 会恒为 0。无自动重试，人跑 `retry` 或解冲突都算失败 |
 
 ---
 
@@ -205,6 +206,27 @@ D9 的验收原本有一条「制造卡死的 handler，看门狗 3 分钟内放
 | 进程活着，handler 卡死 | 心跳照跳 | 不会自动回 `pending`。15/25 分钟子进程超时后转 `failed`，用 `cli.py retry` 重排。**这段时间整条队列停摆（队头阻塞）** —— 由 #26 解决 |
 
 **`≤120s` 而不是 `≤90s`**：上界是「最后一拍 + 租约」，而心跳每 30s 一拍，所以从崩溃到被回收最多 120s，且前提是有人把 worker 再起来。
+
+### 18. 为什么闭环要拆成两段
+
+「闭环成功率」原来的判据是「PR 开出来 + 自检全绿 + 有待批 approval」，听着合理，但和状态机矛盾：
+
+- `handle_issue_fix` 的 docstring：*A green suite is evidence, not permission: this never commits, pushes or opens a PR.* 一次 run 成功时写的是 `status='waiting'` 的 approval 行。
+- PR 由 `execute_approval` 里的 `open_pr` 开，入口是 `process_approvals`，它只捞 `status='approved' AND executed_at IS NULL`（`db.py:366`）。
+
+所以「PR 已开」和「行还 waiting」在同一时刻不可能同时成立。三条一起当判据，自动判定恒为 0，指标永远测不出来。
+
+拆成两段之后各自可判：
+
+| 段 | 判据 | 谁做 |
+|---|---|---|
+| a 产出 | run 结束 + `waiting` approval + 自检全绿 | wick |
+| b 落地 | `executed_at` 非空 + PR 真开出来 | 人批准 → `process_approvals` |
+
+**顺带修正两处过强的话**：
+
+- **没有自动重试**。失败是 `failed` 终态，重排要人跑 `cli.py retry`（它自己注释写着 "The only retry the system has"）。所以「允许自动重试一次」是假的，按不人工干预的口径，需要 retry 就算失败。
+- **n=4 不能支撑 ≥90%**。4/4 的 95% 置信区间约 40%–100%（Clopper-Pearson 下界 `exp(log(0.025)/4)` ≈ 0.398）。所以 README 与 ROADMAP 都改成报 n/N。
 
 ## 被否决的候选（避免重复讨论）
 

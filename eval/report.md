@@ -1,13 +1,13 @@
 # wick 可靠性验收（D9 / issue #6）
 
-实测生成：2026-11-24 00:50（本机实跑，非 agent 自报）。每条数字都能用第三列的复现命令重新跑出来。
+实测生成：2026-11-25 02:12（本机实跑，非 agent 自报）。每条数字都能用第三列的复现命令重新跑出来。
 
 | 验收项 | 实测值 | 判定 | 复现命令 |
 | --- | --- | --- | --- |
 | 重复处理率 0（同一事件灌 3 次） | events=1 行（status=done，attempts=1），deliveries=1 条，实际发出=1 次 | ✅ 通过 | `python eval/reliability.py --dup` |
 | 崩溃恢复（kill /F 后重跑、不重复投递） | 最终 status=done，attempts=2（1 次被 kill + 1 次重跑），deliveries=1 条，实际发出=1 次 | ✅ 通过 | `python eval/reliability.py --crash` |
-| 假死恢复（不重启，3 分钟内放回 pending） | 200s 内状态一直是 running；心跳年龄在 2.4–22.5s 之间反复归零（每 30s 续一次，租约 90s），从未被回收，事件没回到 pending | ⚠️ **已知上限** | `python eval/reliability.py --zombie` |
-| 闭环成功率 ≥90% | 待补（需要 ≥10 条真实 issue 的完整记录） | 待测 | — |
+| 假死恢复（不重启，3 分钟内放回 pending） | 200s 内状态一直是 running；心跳年龄在 2.0–22.1s 之间反复归零（每 30s 续一次，租约 90s），从未被回收，事件没回到 pending | ⚠️ **已知上限** | `python eval/reliability.py --zombie` |
+| 闭环成功率 | 待测：n/0 ｜a 段 = waiting approval + 自检全绿（worker 实跑）；b 段 = 批准后 executed_at 非空且 detail.execution_error 为空且 deliveries 有 PR URL；分子 = a 且 b 都成功；只读分析不进样本；无自动重试（定义见 README，issue #29） | 待测 | — |
 | 投递误报率 ≤20% | 待补（前 20 条人工标注明细） | 待测 | — |
 
 ## 假死恢复：为什么 3 分钟做不到（计算过程）
