@@ -657,7 +657,11 @@ if __name__ == "__main__":
         # so adding a check to CHECKS above picks it up everywhere without editing
         # the workflow -- three copies of the list drifted apart once already.
         root = Path(__file__).resolve().parent.parent
-        result = run_checks(root)
+        # Shorter than CHECK_TIMEOUT (300s) on purpose: twelve checks at 300s worst
+        # case is an hour, while CI allows this job five minutes. A small timeout
+        # fails on the check that is slow instead of cancelling the whole job with
+        # no indication which one hung.
+        result = run_checks(root, timeout=120)
         for r in result["results"]:
             print(f"  {'OK  ' if r['ok'] else 'FAIL'} {r['cmd']}")
             if not r["ok"]:

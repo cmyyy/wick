@@ -28,9 +28,16 @@ COMMITTED = ROOT / "eval" / "report.md"
 
 # Things that differ on every run BY DESIGN. Everything not matched here is
 # compared verbatim, so a doctored number or a rewritten sentence fails.
+#
+# Both patterns are deliberately narrow. An earlier version masked the whole
+# timestamp LINE, which also covered the provenance sentence on it ("本机实跑，
+# 非 agent 自报") and the reproducibility claim beside it -- so a version saying
+# the numbers could not be reproduced passed. And the range pattern matched any
+# `N.N-N.Ns` shape regardless of context, which would silently swallow a future
+# real measurement that happened to look like one.
 _VOLATILE = (
-    (re.compile(r"^实测生成：.*$", re.M), "实测生成：<stamp>"),
-    (re.compile(r"\d+\.\d+\s*[–-]\s*\d+\.\d+s"), "<range>s"),
+    (re.compile(r"实测生成：\d{4}-\d{2}-\d{2} \d{2}:\d{2}"), "实测生成：<stamp>"),
+    (re.compile(r"心跳年龄在 \d+\.\d+\s*[–-]\s*\d+\.\d+s"), "心跳年龄在 <range>s"),
 )
 
 
@@ -77,6 +84,9 @@ def selftest() -> int:
     doctored_number = base.replace("deliveries=1 条", "deliveries=7 条")
     doctored_prose = base.replace("3 分钟回收 = 0 次", "3 分钟回收已实现")
     doctored_verdict = base.replace("| ✅ 通过 | `x` |", "| ❌ 失败 | `x` |")
+    # The line that carries the timestamp also carries this report's provenance.
+    # Masking the whole line used to let this through.
+    doctored_claim = base.replace("（本机实跑）", "（这些数字没有一条能复现）")
 
     cases = [
         ("原样", base, 0),
@@ -84,12 +94,13 @@ def selftest() -> int:
         ("改了实测里的数字", doctored_number, 1),
         ("改了正文的一句话", doctored_prose, 1),
         ("改了判定", doctored_verdict, 1),
+        ("改了时间戳那一行里的声明", doctored_claim, 1),
     ]
     for name, fresh, want in cases:
         got = compare(base, fresh)
         assert got == want, f"{name}: 期望 {want}，实际 {got}"
         print(f"  {'OK  ' if got == want else 'FAIL'} {name} -> {got}")
-    print("check-report selftest OK：5 个用例，改写数字/正文/判定都会红，只有易变部分被放过")
+    print("check-report selftest OK：6 个用例，改写数字/正文/判定/时间戳行声明都会红")
     return 0
 
 
@@ -111,6 +122,10 @@ def main(argv: list[str]) -> int:
         print(f"reliability.py --all 自己就失败了（exit {r.returncode}）——"
               f"这不是手改导致的，先查那次跑", file=sys.stderr)
         return r.returncode
+
+    if not tmp.exists():
+        print(f"reliability.py 退出 0 却没写 {tmp} —— 查那次跑", file=sys.stderr)
+        return 2
 
     if compare(COMMITTED.read_text(encoding="utf-8"), tmp.read_text(encoding="utf-8")) == 0:
         print("一致：整份文件逐字相同（时间戳与心跳区间按设计忽略）")

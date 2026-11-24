@@ -33,7 +33,7 @@ hermes -p developer chat --in ~ -c "Bot Chat" --create-if-missing -Q -q   "实�
 
 **合格**：
 - 「浏览器里四块都渲染了、点批准该行消失，库里 `executed_at` 仍是 NULL」
-- 「真子进程 + 真端口 + 真库，十一个自检全绿，三处变异都红」
+- 「真子进程 + 真端口 + 真库，十二个自检全绿，三处变异都红」
 
 **不合格**：
 - 「插件被发现了」—— 哪个发现？进程内调函数，还是服务里真扫到？
@@ -135,9 +135,9 @@ python src/server.py --selftest
 python eval/check-report.py --selftest
 ```
 
-清单的**唯一事实源**是 `src/agent.py` 里的 `CHECKS`——`python src/agent.py --checks` 跑的就是它，CI 也调这一条。上面的列表是给人读的，改了 `CHECKS` 它会跟着变，不用手工同步三处。
+**代码层只有一个事实源**：`src/agent.py` 里的 `CHECKS`。`python src/agent.py --checks` 跑的就是它，CI 调的也是这一条，所以往 `CHECKS` 里加一项，CI 和 worker 的门槛都会跟着走。
 
-十二个全绿再提（CI 跑的也是这一份，见下文）。新增模块时把它的自检加进这份清单，`src/agent.py` 里的 `CHECKS` 也要同步——那是 worker 跑 agent 改动后实际执行的门槛，不同步等于新模块坏了没人管。
+**上面的列表是给人读的，CI 不读它，改 `CHECKS` 它也不会自动变**——要手工跟一次。这句话上一版写成"不用手工同步"，那是假的：`README` 里曾有一份十条的副本落后了两条没人发现，就是这个代价。所以：**加自检 = 改 `CHECKS`（必须）+ 顺手改这份列表（给下一个人看）。**
 
 ## 可靠性验收（改动了 worker / db / outbox 才跑）
 
@@ -173,7 +173,7 @@ python eval/check-report.py --selftest # 1 秒：只验解析器本身
 
 ## 自动跑的部分
 
-`.github/workflows/checks.yml` 在 PR 上跑那 11 个自检（14 秒，无依赖、无网络）。不需要谁记得跑。
+`.github/workflows/checks.yml` 在 PR 上跑全部自检（14 秒，无依赖、无网络）。不需要谁记得跑。
 
 **没进 CI 的两个**：
 

@@ -130,7 +130,7 @@ def send_recorder(tmp: Path, tag: str) -> tuple[Path, Path]:
 def worker_env(tmp: Path, fake: Path, send_py: Path, slow: bool, db_path: Path) -> dict:
     env = dict(os.environ)
     env.update({
-        "WICK_MODE": "analyze",           # no worktree, no 11 checks: only the run itself
+        "WICK_MODE": "analyze",           # no worktree, no self-checks: only the run itself
         "WICK_HERMES_BIN": str(fake),
         "WICK_PROGRESS_DIR": str(tmp / "progress"),
         "WICK_SEND_CMD": f'"{sys.executable}" "{send_py}"',
