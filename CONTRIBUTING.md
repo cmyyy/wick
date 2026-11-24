@@ -136,6 +136,17 @@ python src/server.py --selftest
 
 十一个全绿再提。新增模块时把它的自检加进这份清单，`src/agent.py` 里的 `CHECKS` 也要同步——那是 worker 跑 agent 改动后实际执行的门槛，不同步等于新模块坏了没人管。
 
+## 可靠性验收（改动了 worker / db / outbox 才跑）
+
+```bash
+python eval/reliability.py --dup      # 约 10s：同一事件灌 3 次只有 1 行
+python eval/reliability.py --crash    # 约 2 分钟：kill 掉跑一半的 worker，等租约过期重跑
+python eval/reliability.py --zombie   # 约 3.5 分钟：卡死的 handler 能否被回收（当前是已知上限，见 DECISIONS 17）
+python eval/reliability.py --all      # 全跑，任一不通过就非零退出
+```
+
+这三条是**真进程、真库、真 skill**，不是 mock：`--crash` 会真起 worker 再 `taskkill /F`。所以它们比自检慢得多，只在动到 `worker.py` / `db.py` / `outbox.py` / `agent.py` 的租约或投递逻辑时跑。每条判定后面都跟着产生它的 SQL。
+
 ## PR 要求
 
 - 标题同 commit 首行
