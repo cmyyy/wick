@@ -102,6 +102,12 @@ def _pr_body(detail: dict, branch: str, sha: str, number: int | str, repo: str) 
         f"## 怎么验证的\n\n"
         f"wick 在 worktree 里跑了项目的自检，{checks} 项全绿。"
         f"自检由 worker 实际执行，不是 agent 自报。\n\n"
+        # A section that always exists, even when nothing was reviewed. CONTRIBUTING
+        # says the orchestrator's prose goes through review too; a rule whose only
+        # landing spot is a sentence in a doc leaves no visible trace when skipped.
+        # This is the trace: skip the review and "未填写" is what ships.
+        f"## 审了什么\n\n"
+        f"{detail.get('review') or '未填写 —— 若这条跳过 reviewer，在这里写理由。'}\n\n"
         f"## 遗留\n\n"
         f"无。若 review 中发现，补在评论里。\n\n"
         f"---\n\n"
@@ -220,8 +226,19 @@ def _selftest() -> int:
     bare = _pr_body({}, "b", "sha", 2, "a/b")
     assert "## 改了什么" in bare and "（见 diff）" in bare, bare[:200]
 
+    # "审了什么" is always present. CONTRIBUTING says the orchestrator's prose goes
+    # through review; the section is the only visible trace when that is skipped, so
+    # it must not be conditional on detail carrying a review field.
+    assert "## 审了什么" in bare, "PR body 少了审了什么这一节"
+    assert "未填写" in bare, "没写 review 时该显式说未填写，而不是安静地省略"
+    with_review = _pr_body({"review": "reviewer: 2 条严重，已改"}, "b", "sha", 3, "a/b")
+    assert "reviewer: 2 条严重，已改" in with_review
+    assert "未填写" not in with_review, "填了 review 就不该再出现未填写"
+    # And it sits between 怎么验证的 and 遗留, which is where a reviewer of the PR looks.
+    assert bare.index("## 怎么验证的") < bare.index("## 审了什么") < bare.index("## 遗留")
+
     print("actions.py selftest OK: 空提交拒绝 / commit+push 落地 / 未知动作拒绝 / "
-          "commit 前缀按 label / PR body 三节")
+          "commit 前缀按 label / PR body 四节（含无 review 时的未填写）")
     return 0
 
 

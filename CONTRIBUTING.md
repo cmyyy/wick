@@ -46,6 +46,20 @@ hermes -p developer chat --in ~ -c "Bot Chat" --create-if-missing -Q -q   "实�
 
 **进程内调用不是集成证据。** 调一个函数拿到期望值，只证明那个函数在当前环境下正确，不证明真实进程会走到它。D8 的 dashboard 插件就是这么翻车的：进程内 `_discover_dashboard_plugins()` 返回它，运行中服务的 `/api/dashboard/plugins` 里没有，浏览器侧边栏只有 Kanban / Achievements。
 
+#### 这类错长什么样
+
+五条都是真实发生过的。共同点不在作者（有的是编排者写的，有的是实现者写的），在**写的时候都以为对**。每行第三列是当场能核的命令：
+
+| 写下的 | 实际 | 怎么核 |
+|---|---|---|
+| 「那个 key 在全仓任何分支都没有写者」 | 当时确实没有；#25 合入之后有了（`src/db.py:42`） | `git log --all -S"stats:stale_requeued"` |
+| 「预算 = `FIX_TIMEOUT + 4×CHECK_TIMEOUT`」 | 代码里没有这个预算 | `grep -rn "FIX_TIMEOUT + 4" src/` |
+| 「心跳反复在 2.8–22.9s 之间」 | 手打进生成器的常量，不是采样 | `git log -p 1c16af2 -- eval/reliability.py` |
+| 「wick 内部不恢复」 | 子进程超时转 `failed`（fix 最坏 1500s + 11×`CHECK_TIMEOUT`）；重排要人手动 `cli.py retry` | `grep -n "FIX_TIMEOUT\|CHECK_TIMEOUT" src/agent.py` |
+| 「手改 `report.md` 会被抓」 | 当时的检查只比判定列，改数字和改正文全放过 | `git log -p abe3730 -- eval/check-report.py` |
+
+写这类句子时，**先把第三列跑一遍**。跑不出所示输出的，句子就还没到能写的程度。
+
 ### 每一轮改动都派 reviewer
 
 不由编排者判断「这次改动小 / 逻辑没变 / 只是换壳，就不派了」。
@@ -70,6 +84,18 @@ reviewer 不是可选复核，它是唯一能对冲「编排者倾向于接受�
 - `git log -S "<符号>"` 的输出
 - 已合并进 `main` 的 commit
 - 未合并，那就写 PR 号
+
+### 写「做不到 X」之前，读一遍兜底路径
+
+`except` 分支、超时处理、有没有另一条命令能补救。
+
+2026-11-24 我写过「agent 不能 merge」，证据是 `grep merge src/actions.py` 零匹配。但 agent 是带 shell 的 `hermes -z` 子进程，环境里有 `gh`——拦住它的是 `src/prompts/issue_fix.md:60` 的提示词禁令，**不是代码里没有那条路**。证据能覆盖的范围比结论小，就是写反了。
+
+### 「通过」要能点出机制
+
+一个检查通过，要说得清是**哪个机制**让它通过的：唯一索引、fence、超时、还是上下文差异。点不出来就是没验。
+
+两次栽在这上面。`--crash` 演练里「`deliveries` 仍 1 条」有一半是结构性保证——`add_delivery` 在 `handle()` 返回之后才调用，被 kill 的那次 attempt 根本没机会写投递，所以 fence 坏了它也会通过。`check-report.py` 抓到改数字是靠上下文差异，不是因为它比对了那个数字。
 
 **「已经在落」这种时态不算证据。** 它正是让一个不存在的 key 看起来已定案的说法。
 
@@ -150,36 +176,6 @@ python eval/reliability.py --all      # 全跑，任一不通过就非零退出
 
 这三条是**真进程、真库、真 skill**，不是 mock：`--crash` 会真起 worker 再 `taskkill /F`。所以它们比自检慢得多，只在动到 `worker.py` / `db.py` / `outbox.py` / `agent.py` 的租约或投递逻辑时跑。每条判定后面都跟着产生它的 SQL。
 
-## 编排者的产出也要过 reviewer
-
-代码走 review，编排者写的**文字**不走 —— 这是已经付过代价的漏洞。
-
-**什么时候**：派活的 ticket 发出去之前、验收报告写完之后、PR 提交之前。
-
-**要过的东西**：这三样。
-
-**为什么不是「应该」而是流程里的一步**：这一轮的实际记录是四份审出八个问题，**每一个都是编排者的**，而且每一个都是编排者自己看不见的：
-
-| 写下的 | 实际 |
-|---|---|
-| 「#10 已经在落这个计数」 | 那个 key 在全仓任何分支都不存在 |
-| 「预算 = `FIX_TIMEOUT + 4×CHECK_TIMEOUT`」 | 代码里没有这个预算 |
-| 「心跳反复在 2.8–22.9s 之间」 | 手打进生成器的常量，不是采样值 |
-| 「wick 内部不恢复」 | 15/25 分钟子进程超时转 `failed`，`cli.py retry` 能重排 |
-| 「手改 `report.md` 会被抓」 | 当时的检查只比判定列，改数字和改正文全放过 |
-
-共同点是**写的时候都以为对**。这不是打字错误，是判断层面的自信错误 —— 靠「以后更认真」改不了，所以它需要一道外部检查，而不是一条自我要求。
-
-**审什么**（三条，每条都能当场核对，不用读代码逻辑）：
-
-1. **每个数字有出处吗** —— 它后面有没有一条能跑出这个数的命令？没有就把数字删掉，或者先去跑一遍再写。
-2. **每条断言能复现吗** —— 尤其「X 已经在做 Y」这类时态。要求 `git log -S "<符号>"` 的输出、已合并的 commit，或 PR 号。**「已经在落」不算证据**。
-3. **边界有没有写反** —— 写「做不到 X」之前，读一遍相关代码的兜底路径：`except` 分支、超时处理、有没有另一条命令能补救。
-
-**成本**：读文档，不跑代码，一轮对话。
-
-**它报的严重问题只有两种下场**：改，或者把不改的理由写进 PR 的「遗留」节。没有第三种 —— 「派了、被指出、照样合」不算合规。
-
 ## 生成物不要手改
 
 `eval/report.md` 是 `python eval/reliability.py --all` 的输出，它的判定列由脚本算出来。手改它会被抓出来：
@@ -230,7 +226,8 @@ python eval/check-report.py --selftest # 1 秒：只验解析器本身
 **无法用 GitHub 机制闭环的**
 
 - **"必须走 PR"和"agent 不 merge"**：GitHub 的 `required_pull_request_reviews` 要求至少 1 个 approval，而单人仓库里作者不能批准自己的 PR——开了等于把整个仓库锁死。所以没开。
-- 真正的约束是两件事：① `src/actions.py` 里**没有 merge 路径**（只有 commit / push / PR）—— 这条 2026-11-24 核过，`grep merge src/actions.py` 零匹配；agent 即使想 merge 也没有那条代码；② 人 review 每个 PR。
+- 真正的约束是两件事：① **wick 的审批执行路径**里没有 merge——`src/actions.py` 只有 commit / push / PR，2026-11-24 核过，`grep merge src/actions.py` 零匹配；② 人 review 每个 PR。
+- ⚠️ ① 只覆盖审批路径。**agent 自己是带 shell 的 `hermes -z` 子进程**，环境里有 `gh`，理论上有能力 `gh pr merge`；拦住它的是 `src/prompts/issue_fix.md:60` 的提示词禁令，不是代码里没有那条路。把这两件事混成"能力缺失"会高估约束强度（`grep -rn merge src/` 不是零，2 处命中都在那句禁令）。
 - 要机制化，需要第二个账号（bot reviewer）或 CI 门禁——都超出当前范围。
 
 **结论**：这条规则是**约定 + 能力缺失**，不是强制。任何文档都不该把它写成"已经强制"。等真有第二个账号时再改这一节。
@@ -242,7 +239,7 @@ python eval/check-report.py --selftest # 1 秒：只验解析器本身
 | 结论可指认（命令 + 输出 + 作用域） | **约定** | PR body 的「怎么验证的」节，要贴原始输出 |
 | reviewer 每轮必派 | **约定** | PR「遗留」节里的 reviewer 结论；严重问题只有"改"或"说明为什么不改"两种下场 |
 | 技术断言要出处 | **约定 + 一条可跑命令** | `git log -S` 输出 / 已合并 commit / 在途 PR 号 |
-| 编排者的产出也过 reviewer | **约定**（本仓库有 `wick-reviewer` 可派，但它自己也是 agent，不构成独立批准） | PR body 里的「审了什么」；严重问题只有「改」或「写进遗留」两种下场 |
+| 编排者的产出也过 reviewer | **约定 + 一个可见的落点**（`wick-reviewer` 自己也是 agent，不构成独立批准） | `_pr_body` 生成的 PR body 里固定有一节 `## 审了什么`；跳过审就会写出「未填写」 |
 
 四条都没有机制兜底。它们的价值在于**把"我在骗自己"翻译成一句可以当场核对的话**，而不是让人以为已经被强制了。
 
