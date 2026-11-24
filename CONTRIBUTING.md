@@ -55,7 +55,7 @@ hermes -p developer chat --in ~ -c "Bot Chat" --create-if-missing -Q -q   "实�
 | 「那个 key 在全仓任何分支都没有写者」 | 当时确实没有；#25 合入之后有了（`src/db.py:42`） | `git log --all -S"stats:stale_requeued"` |
 | 「预算 = `FIX_TIMEOUT + 4×CHECK_TIMEOUT`」 | 代码里没有这个预算 | `grep -rn "FIX_TIMEOUT + 4" src/` |
 | 「心跳反复在 2.8–22.9s 之间」 | 手打进生成器的常量，不是采样 | 现在是采样值：`grep -n "由 check_zombie 采样算出" eval/reliability.py`；原始那版见 PR #27 的首个 commit |
-| 「wick 内部不恢复」 | 子进程超时转 `failed`（fix 最坏 1500s + 11×`CHECK_TIMEOUT`）；重排要人手动 `cli.py retry` | `grep -n "finish_event.*failed" src/worker.py`（超时在 `agent.py:328` 抛出，`worker.py:177` 接住写 failed） |
+| 「wick 内部不恢复」 | 子进程超时转 `failed`（fix 最坏 1500s + 11×`CHECK_TIMEOUT`）；重排要人手动 `cli.py retry` | `grep -n "finish_event.*failed" src/worker.py`（超时在 `agent.py:327-330` 的 try/except 里抛出，`worker.py:177` 接住写 failed） |
 | 「手改 `report.md` 会被抓」 | PR #35 首版只比判定列，改数字和改正文全放过 | 现在整份逐字比：`grep -n "_VOLATILE" eval/check-report.py` |
 
 写这类句子时，**先把第三列跑一遍**。跑不出所示输出的，句子就还没到能写的程度。
@@ -236,7 +236,7 @@ python eval/check-report.py --selftest # 1 秒：只验解析器本身
 
 **结论**：这条规则是**约定（人 review + prompt 禁令）+ 审批路径里的能力缺失**，不是强制。任何文档都不该把它写成"已经强制"。等真有第二个账号时再改这一节。
 
-**§ 验证纪律的五条（前三条 2026-11-22，后两条 2026-11-24）**
+**§ 验证纪律的五条 + 编排者的一条（五条 2026-11-22 / 11-24，末行 11-24）**
 
 | 规则 | 性质 | 落地物 |
 |---|---|---|
@@ -245,9 +245,9 @@ python eval/check-report.py --selftest # 1 秒：只验解析器本身
 | 技术断言要出处 | **约定 + 一条可跑命令** | `git log -S` 输出 / 已合并 commit / 在途 PR 号 |
 | 写「做不到 X」前读兜底路径 | **约定** | review 结论里能指出漏读的 `except` / 超时 / 补救命令 |
 | 「通过」要能点出机制 | **约定** | 「怎么验证的」节里点名机制（唯一索引 / fence / 超时），点不出就是没验 |
-| 编排者的产出也过 reviewer | **约定 + 一个可见的落点**（`wick-reviewer` 自己也是 agent，不构成独立批准） | `_pr_body` 生成的 PR body 里固定有一节 `## 审了什么`；跳过审就会写出「未填写」 |
+| 编排者的产出也过 reviewer | **约定 + 一个可见的落点**（`wick-reviewer` 自己也是 agent，不构成独立批准） | `_pr_body` 生成的 PR body 里固定有一节 `## 审了什么`，**默认「未填写」，由人在 review 之后手填** —— 它生成于 PR 创建时，而 review 发生在那之后，所以系统不可能自动填对它 |
 
-四条都没有机制兜底。它们的价值在于**把"我在骗自己"翻译成一句可以当场核对的话**，而不是让人以为已经被强制了。
+六条都没有机制兜底。它们的价值在于**把"我在骗自己"翻译成一句可以当场核对的话**，而不是让人以为已经被强制了。
 
 ## 唯一的例外
 
