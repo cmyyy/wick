@@ -39,7 +39,11 @@ def branch_name(event_id: int, issue_number: int | str, attempt: int) -> str:
     must never land on the worktree a stalled attempt is still editing -- so the
     attempt gets its own path AND its own branch (issue #1).
     """
-    return f"wick/issue-{issue_number}-run-{event_id}-attempt-{attempt}"
+    # A hand-queued task (#30) has no issue number, so this arrives as "?" --
+    # and git rejects "?" in a ref. Sanitize here rather than at each caller:
+    # every branch name in the system comes through this function.
+    safe = re.sub(r"[^0-9A-Za-z._-]+", "-", str(issue_number)).strip("-") or "manual"
+    return f"wick/issue-{safe}-run-{event_id}-attempt-{attempt}"
 
 
 def create(repo: Path, event_id: int, issue_number: int | str, base: str = "HEAD",
@@ -118,7 +122,18 @@ def prune(repo: Path, keep_pattern: str | None = None) -> list[str]:
 
 def _selftest() -> int:
     """Self-check: create -> edit -> diff -> remove, against a throwaway repo."""
+    import subprocess as sp
     import tempfile
+
+    # A hand-queued task (#30) has no issue number: it arrives as "?" and git
+    # rejects "?" in a ref. Assert the produced name is one git accepts, instead
+    # of asserting on our own regex.
+    odd = branch_name(7, "?", 2)
+    chk = sp.run(["git", "check-ref-format", "--branch", odd],
+                 capture_output=True, text=True)
+    assert chk.returncode == 0, f"branch_name 产出了 git 不接受的名: {odd}"
+    assert "?" not in odd, odd
+    assert branch_name(7, 123, 1) == "wick/issue-123-run-7-attempt-1"
 
     global WORKTREE_ROOT
     with tempfile.TemporaryDirectory() as td:

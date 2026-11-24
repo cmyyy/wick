@@ -10,6 +10,8 @@ Usage:
     python src/cli.py reject <id>
     python src/cli.py retry <event_id>
     python src/cli.py schedule <ISO 时间> <做什么>
+    python src/cli.py enqueue --title "改什么" [--repo owner/name] [--number 12]
+    python src/cli.py pause [--off]
     python src/cli.py panel [--port 9119]
 """
 from __future__ import annotations
@@ -163,6 +165,52 @@ def cmd_schedule(args) -> int:
         conn.close()
 
 
+def cmd_enqueue(args) -> int:
+    """Queue a task by hand so the worker picks it up like any other event (#30).
+
+    source_id defaults to a timestamp, not the title: dedupe_key is
+    sha256("manual:<source_id>") and UNIQUE, so a title-derived id would silently
+    swallow the second dispatch of the same work. Pass --id to deliberately
+    re-use an id and hit dedupe.
+    """
+    conn = connect(args)
+    try:
+        sid = args.id or db.now()
+        payload = {"title": args.title}
+        if args.repo:
+            payload["repo"] = args.repo
+        if args.number:
+            payload["number"] = args.number
+        eid, created = db.enqueue(conn, "manual", sid, payload)
+        conn.commit()
+        if created:
+            print(f"已派活 #{eid}（manual:{sid}）：{args.title}")
+        else:
+            print(f"已存在 #{eid}（dedupe 命中，未重复入队）：{args.title}")
+        return 0
+    finally:
+        conn.close()
+
+
+def cmd_pause(args) -> int:
+    """Stop handing out manual work; other sources keep running (#30).
+
+    A switch in meta, not a deleted row: the queued work stays queued and resumes
+    where it was, which is what makes this a usable escape hatch.
+    """
+    conn = connect(args)
+    try:
+        db.set_meta(conn, "manual_paused", "0" if args.off else "1")
+        conn.commit()
+        if args.off:
+            print("已恢复：manual 派活会重新被领走")
+        else:
+            print("已暂停：manual 派活不再被领走（已入队的还在，--off 恢复）")
+        return 0
+    finally:
+        conn.close()
+
+
 def cmd_panel(args) -> int:
     """Serve the D8 page (src/server.py). Blocks until Ctrl+C."""
     import server
@@ -202,6 +250,26 @@ def _selftest() -> int:
             with redirect_stdout(buf):
                 rc = fn(argparse.Namespace(db=str(path), **kw))
             return rc, buf.getvalue()
+
+        # enqueue (#30): a hand-queued task lands as a manual event the worker can
+        # claim, and the same call twice is deduped rather than silently doubled.
+        rc, out = run(cmd_enqueue, title="改一下 CONFIG 注释", repo="cmyyy/wick", number=None, id="固定-id")
+        assert rc == 0 and "已派活" in out, out
+        rc2, out2 = run(cmd_enqueue, title="改一下 CONFIG 注释", repo="cmyyy/wick", number=None, id="固定-id")
+        assert rc2 == 0 and "dedupe 命中" in out2, out2
+        c = db.connect(path)
+        row = c.execute("SELECT source_type, source_id, payload FROM events "
+                        "WHERE source_id='固定-id'").fetchone()
+        assert row["source_type"] == "manual", row["source_type"]
+        assert json.loads(row["payload"])["title"] == "改一下 CONFIG 注释"
+        # pause (#30): excluding manual must not hide a github_issue sitting in the
+        # same queue -- otherwise the escape hatch is just a stop button.
+        db.enqueue(c, "github_issue", "cmyyy/wick#99", {"title": "issue 那条"})
+        c.commit()
+        got = db.claim_next(c, "cli-selftest", exclude_sources=("manual",))
+        assert got is not None and got["source_type"] == "github_issue", dict(got) if got else None
+        c.close()
+        assert not [r for r in db.connect(path).execute("SELECT id FROM events WHERE source_id='固定-id' AND status='running'")]
 
         rc, out = run(cmd_status)
         assert rc == 0 and "events" in out and "deliveries" in out, out
@@ -274,6 +342,15 @@ def main() -> int:
     p.add_argument("when", help="ISO 时间，如 2026-11-23T09:00:00+08:00（不带偏移按本机时区）")
     p.add_argument("what", help="到时候做什么")
     p.set_defaults(func=cmd_schedule)
+    p = sub.add_parser("enqueue", help="派一条活给 worker（issue #30）")
+    p.add_argument("--title", required=True, help="要做什么")
+    p.add_argument("--repo", default=None, help="owner/name（改代码时必填）")
+    p.add_argument("--number", type=int, default=None, help="关联的 issue 号（可选）")
+    p.add_argument("--id", default=None, help="source_id（默认当前时间戳；同名重派需显式给）")
+    p.set_defaults(func=cmd_enqueue)
+    p = sub.add_parser("pause", help="暂停/恢复 manual 派活")
+    p.add_argument("--off", action="store_true", help="恢复派活")
+    p.set_defaults(func=cmd_pause)
     p = sub.add_parser("panel", help="起本地面板（D8）")
     p.add_argument("--port", type=int, default=9119, help="监听端口（0 = 让 OS 分配）")
     p.add_argument("--db", default=None, help="数据库路径（默认 WICK_DB 或 ~/.wick/wick.db）")

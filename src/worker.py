@@ -50,7 +50,10 @@ def handle(conn, event) -> str:
     approval; "analyze" (D3) only reports a plan. Other source types take the
     placeholder path until they have a prompt of their own.
     """
-    if event["source_type"] == "github_issue":
+    if event["source_type"] in ("github_issue", "manual"):
+        # manual is a task I queued by hand (cli.py enqueue, #30). It carries the
+        # same prompt fields as an issue, so it takes the same path -- otherwise
+        # the whole point of queueing it is lost on a placeholder string.
         import agent  # local import: keeps --selftest free of model deps
         if FIX_MODE == "analyze":
             return agent.handle_event(conn, event)
@@ -154,7 +157,7 @@ def _renew_lease(conn, event_id: int, stop: threading.Event) -> None:
             continue
 
 
-def run_once(conn) -> int:
+def run_once(conn, *, exclude_sources: tuple[str, ...] | None = None) -> int:
     """Drain the queue, returning how many events were processed.
 
     Every write after handle() is fenced on the claim. If the lease was reclaimed
@@ -164,7 +167,7 @@ def run_once(conn) -> int:
     """
     processed = 0
     while True:
-        ev = db.claim_next(conn, WORKER_ID)
+        ev = db.claim_next(conn, WORKER_ID, exclude_sources=exclude_sources)
         if ev is None:
             return processed
         stop = threading.Event()
@@ -230,7 +233,8 @@ def serve(conn, interval: int = POLL_INTERVAL, repo: str | None = None,
 
         if process_approvals(conn):
             continue  # an approved action just produced deliveries; drain the queue too
-        n = run_once(conn)
+        paused = db.get_meta(conn, "manual_paused") == "1"
+        n = run_once(conn, exclude_sources=("manual",) if paused else None)
         try:
             # separate step: producing a delivery is not sending it
             stats = outbox.drain(conn)
@@ -473,7 +477,10 @@ def _selftest() -> int:
         with tempfile.TemporaryDirectory() as td:
             once_db = Path(td) / "once.db"
             c2 = db.connect(once_db)
-            db.enqueue(c2, "manual", "stale-once", {"title": "崩溃遗留的那条"})
+            # followup, not manual: manual now takes the real fix path (#30) and a
+            # selftest must not call a model. This case is about --once recovering a
+            # stale claim, which is source-type agnostic.
+            db.enqueue(c2, "followup", "stale-once", {"title": "崩溃遗留的那条"})
             c2.execute("UPDATE events SET status='running', worker_id='dead-worker', "
                        "heartbeat_at=?, attempts=1 WHERE source_id='stale-once'", (stale_ts,))
             c2.commit()
@@ -485,6 +492,22 @@ def _selftest() -> int:
             )
             assert p.returncode == 0, (p.stdout, p.stderr)
             assert "处理了 1 条事件" in p.stdout, p.stdout + p.stderr
+
+        # pause 是逃逸阀，--once 也得认它，否则调试时一个手滑就把挡住的活放出来了。
+        with tempfile.TemporaryDirectory() as td:
+            pdb = Path(td) / "paused.db"
+            c3 = db.connect(pdb)
+            db.enqueue(c3, "manual", "paused-1", {"title": "暂停期间不该被领"})
+            db.set_meta(c3, "manual_paused", "1")
+            c3.commit()
+            c3.close()
+            p = subprocess.run(
+                [sys.executable, str(Path(__file__).parent / "worker.py"),
+                 "--once", "--db", str(pdb)],
+                capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=120,
+            )
+            assert p.returncode == 0, (p.stdout, p.stderr)
+            assert "处理了 0 条事件" in p.stdout, p.stdout + p.stderr
 
         conn.close()
     finally:
@@ -564,7 +587,10 @@ def main() -> int:
             ran = process_approvals(conn)
             if ran:
                 print(f"执行了 {ran} 个已批准的动作")
-            n = run_once(conn)
+            # --once honours pause too: running a one-shot while paused must not
+            # pick up the work the escape hatch was meant to park (#30).
+            paused = db.get_meta(conn, "manual_paused") == "1"
+            n = run_once(conn, exclude_sources=("manual",) if paused else None)
             print(f"处理了 {n} 条事件")
             print(f"投递: {outbox.drain(conn)}")
             return 0

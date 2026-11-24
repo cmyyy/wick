@@ -30,6 +30,10 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 PROMPT_DIR = Path(__file__).resolve().parent / "prompts"
 HERMES_BIN = os.environ.get("WICK_HERMES_BIN", "hermes")
+# The subprocess that writes code runs as its own bot, not as the orchestrator:
+# separate profile means separate memory, so it cannot mistake the orchestrator's
+# assumptions for evidence (#30).
+HERMES_PROFILE = os.environ.get("WICK_HERMES_PROFILE", "wick-dev")
 DEFAULT_TIMEOUT = 900      # seconds; a real code-reading run can take minutes
 FIX_TIMEOUT = 1500         # editing plus testing takes longer than pure analysis
 CHECK_TIMEOUT = 300
@@ -108,7 +112,7 @@ def run_prompt(prompt: str, cwd: str | Path | None = None,
     """
     try:
         p = subprocess.run(
-            [HERMES_BIN, "-z", prompt],
+            [HERMES_BIN, "-p", HERMES_PROFILE, "-z", prompt],
             cwd=str(cwd or PROJECT_ROOT),
             capture_output=True,
             text=True,
