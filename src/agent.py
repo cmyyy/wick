@@ -372,10 +372,14 @@ def handle_issue_fix(conn, event) -> str:
         # that queued an approval and then lost its lease would still open a PR
         # from a stale worktree.
         "attempts": event["attempts"],
-        # Enough context for the PR body to carry the three sections CONTRIBUTING
-        # asks for, without re-reading the agent's transcript later.
+        # Enough context for the PR body to carry the sections CONTRIBUTING asks for,
+        # without re-reading the agent's transcript later. `review` is the input the
+        # 审了什么 section reads; today nothing fills it (no prompt asks the agent to
+        # carry a reviewer verdict through), so it renders as 未填写. That is honest
+        # rather than useful -- see CONTRIBUTING § 验证纪律, and #31.
         "summary": text[:2000],
         "checks": f"{checks['passed']}/{checks['total']}",
+        "review": payload.get("review"),
     }, worker_id=event["worker_id"], attempts=event["attempts"])
     if approval_id is None:
         # The lease was reclaimed while we worked: some other attempt owns the

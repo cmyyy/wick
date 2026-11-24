@@ -54,13 +54,15 @@ hermes -p developer chat --in ~ -c "Bot Chat" --create-if-missing -Q -q   "实�
 |---|---|---|
 | 「那个 key 在全仓任何分支都没有写者」 | 当时确实没有；#25 合入之后有了（`src/db.py:42`） | `git log --all -S"stats:stale_requeued"` |
 | 「预算 = `FIX_TIMEOUT + 4×CHECK_TIMEOUT`」 | 代码里没有这个预算 | `grep -rn "FIX_TIMEOUT + 4" src/` |
-| 「心跳反复在 2.8–22.9s 之间」 | 手打进生成器的常量，不是采样 | `git show f348439:eval/reliability.py \| grep 22.9` |
-| 「wick 内部不恢复」 | 子进程超时转 `failed`（fix 最坏 1500s + 11×`CHECK_TIMEOUT`）；重排要人手动 `cli.py retry` | `grep -n "timeout=FIX_TIMEOUT" -A6 src/agent.py` 看超时后面调的是哪个 `finish_event` |
-| 「手改 `report.md` 会被抓」 | 当时的检查只比判定列，改数字和改正文全放过 | `git log -p abe3730 -- eval/check-report.py` |
+| 「心跳反复在 2.8–22.9s 之间」 | 手打进生成器的常量，不是采样 | 现在是采样值：`grep -n "由 check_zombie 采样算出" eval/reliability.py`；原始那版见 PR #27 的首个 commit |
+| 「wick 内部不恢复」 | 子进程超时转 `failed`（fix 最坏 1500s + 11×`CHECK_TIMEOUT`）；重排要人手动 `cli.py retry` | `grep -n "finish_event.*failed" src/worker.py`（超时在 `agent.py:328` 抛出，`worker.py:177` 接住写 failed） |
+| 「手改 `report.md` 会被抓」 | PR #35 首版只比判定列，改数字和改正文全放过 | 现在整份逐字比：`grep -n "_VOLATILE" eval/check-report.py` |
 
 写这类句子时，**先把第三列跑一遍**。跑不出所示输出的，句子就还没到能写的程度。
 
-第 2、5 行的第三列是「证明它不存在」的命令 —— `grep` 返回 exit 1、输出为空，那正是证据本身，不是命令坏了。其余三行要有输出才算数。
+第 2 行的第三列是「证明它不存在」——`grep` 返回 exit 1、输出为空，那正是证据。其余四行都要有输出才算数。
+
+**不要用 SHA 当证据**，除非那个 commit 在某个 ref 上活着：squash 合入的分支被删之后，原 commit 就成了悬空对象，在你本机能 `git show`，在别人的 clone 上是 `fatal: invalid object name`。本表第一版就犯过这个错。
 
 ### 每一轮改动都派 reviewer
 
@@ -101,7 +103,7 @@ reviewer 不是可选复核，它是唯一能对冲「编排者倾向于接受�
 
 **「已经在落」这种时态不算证据。** 它正是让一个不存在的 key 看起来已定案的说法。
 
-D8 的 ticket 里写「假死回收次数读 `meta['stats:stale_requeued']`（#10 已经在落这个计数）」—— 那个 key 在任何分支都不存在，`git log -S` 为空。developer 照它实现了，面板读到一个永远是 0 的假数字，最后单独开 #20 补数据源。**编排者编一个前提，实现者会照着它把错误固化下来。**
+D8 的 ticket 里写「假死回收次数读 `meta['stats:stale_requeued']`（#10 已经在落这个计数）」—— 那个 key 当时在任何分支都不存在（`git log -S` 为空；#25 合入之后才有了写者）。developer 照它实现了，面板读到一个永远是 0 的假数字，最后单独开 #20 补数据源。**编排者编一个前提，实现者会照着它把错误固化下来。**
 
 实现者有对称的义务：**开工前把 ticket 里每条可验证断言各跑一条**；不成立的停下回问，不要替它实现数据源。
 
@@ -129,7 +131,7 @@ wick/issue-<n>-run-<event_id>[-attempt-<k>]
 
 这是它的 worktree 隔离键，承载 `issue + event + attempt` 三段信息，硬套 `<type>/<issue>-<slug>` 会丢掉 attempt 或长得离谱，所以不套。人 review 的是 PR，不是这个分支名。
 
-wick 产出的 **commit 前缀**确实跟类型走（`src/actions.py` 的 `_commit_prefix()`：按 issue 的 `labels` 映射 `docs`/`chore`/`refactor`/`feat`/`fix`），**PR body 也强制三节**（改了什么 / 怎么验证的 / 遗留）。工具的产出必须符合本文档，否则规则只约束人等于没有规则。
+wick 产出的 **commit 前缀**确实跟类型走（`src/actions.py` 的 `_commit_prefix()`：按 issue 的 `labels` 映射 `docs`/`chore`/`refactor`/`feat`/`fix`），**PR body 固定四节**（改了什么 / 怎么验证的 / 审了什么 / 遗留）。工具的产出必须符合本文档，否则规则只约束人等于没有规则。
 
 ## Commit 格式
 
@@ -229,18 +231,20 @@ python eval/check-report.py --selftest # 1 秒：只验解析器本身
 
 - **"必须走 PR"和"agent 不 merge"**：GitHub 的 `required_pull_request_reviews` 要求至少 1 个 approval，而单人仓库里作者不能批准自己的 PR——开了等于把整个仓库锁死。所以没开。
 - 真正的约束是两件事：① **wick 的审批执行路径**里没有 merge——`src/actions.py` 只有 commit / push / PR，2026-11-24 核过，`grep merge src/actions.py` 零匹配；② 人 review 每个 PR。
-- ⚠️ ① 只覆盖审批路径。**agent 自己是带 shell 的 `hermes -z` 子进程**，环境里有 `gh`，理论上有能力 `gh pr merge`；拦住它的是 `src/prompts/issue_fix.md:60` 的提示词禁令，不是代码里没有那条路。把这两件事混成"能力缺失"会高估约束强度（`grep -rn merge src/` 不是零，2 处命中都在那句禁令）。
+- ⚠️ ① 只覆盖审批路径。**agent 自己是带 shell 的 `hermes -z` 子进程**，环境里有 `gh`，理论上有能力 `gh pr merge`；拦住它的是 `src/prompts/issue_fix.md:60` 的提示词禁令，不是代码里没有那条路。把这两件事混成"能力缺失"会高估约束强度（`grep -rn merge src/` 不是零：`issue_fix.md:60` 是禁令，`:64` 只是「merge 后再跟进」的示例）。
 - 要机制化，需要第二个账号（bot reviewer）或 CI 门禁——都超出当前范围。
 
-**结论**：这条规则是**约定 + 能力缺失**，不是强制。任何文档都不该把它写成"已经强制"。等真有第二个账号时再改这一节。
+**结论**：这条规则是**约定（人 review + prompt 禁令）+ 审批路径里的能力缺失**，不是强制。任何文档都不该把它写成"已经强制"。等真有第二个账号时再改这一节。
 
-**§ 验证纪律的三条（2026-11-22 新增）**
+**§ 验证纪律的五条（前三条 2026-11-22，后两条 2026-11-24）**
 
 | 规则 | 性质 | 落地物 |
 |---|---|---|
 | 结论可指认（命令 + 输出 + 作用域） | **约定** | PR body 的「怎么验证的」节，要贴原始输出 |
 | reviewer 每轮必派 | **约定** | PR「遗留」节里的 reviewer 结论；严重问题只有"改"或"说明为什么不改"两种下场 |
 | 技术断言要出处 | **约定 + 一条可跑命令** | `git log -S` 输出 / 已合并 commit / 在途 PR 号 |
+| 写「做不到 X」前读兜底路径 | **约定** | review 结论里能指出漏读的 `except` / 超时 / 补救命令 |
+| 「通过」要能点出机制 | **约定** | 「怎么验证的」节里点名机制（唯一索引 / fence / 超时），点不出就是没验 |
 | 编排者的产出也过 reviewer | **约定 + 一个可见的落点**（`wick-reviewer` 自己也是 agent，不构成独立批准） | `_pr_body` 生成的 PR body 里固定有一节 `## 审了什么`；跳过审就会写出「未填写」 |
 
 四条都没有机制兜底。它们的价值在于**把"我在骗自己"翻译成一句可以当场核对的话**，而不是让人以为已经被强制了。
