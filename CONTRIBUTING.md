@@ -27,7 +27,7 @@ hermes -p developer chat --in ~ -c "Bot Chat" --create-if-missing -Q -q   "实�
 
 ## 验证纪律
 
-三条都来自实际失误（D7 / D8），不是预防性的空话。
+五条都来自实际失误（D7 / D8 / D9 / #31），不是预防性的空话。
 
 ### 结论必须能指认验证它的是什么
 
@@ -52,7 +52,7 @@ hermes -p developer chat --in ~ -c "Bot Chat" --create-if-missing -Q -q   "实�
 
 | 写下的 | 实际 | 怎么核 |
 |---|---|---|
-| 「那个 key 在全仓任何分支都没有写者」 | 当时确实没有；#25 合入之后有了（`src/db.py:42`） | `git log --all -S"stats:stale_requeued"` |
+| 「那个 key 在全仓任何分支都没有写者」 | 当时确实没有；#25 合入之后有了写者（`src/db.py` 的 `requeue_stale` 调 `set_meta`） | `grep -n "set_meta" src/db.py` |
 | 「预算 = `FIX_TIMEOUT + 4×CHECK_TIMEOUT`」 | 代码里没有这个预算 | `grep -rn "FIX_TIMEOUT + 4" src/` |
 | 「心跳反复在 2.8–22.9s 之间」 | 手打进生成器的常量，不是采样 | 现在是采样值：`grep -n "由 check_zombie 采样算出" eval/reliability.py`；原始那版见 PR #27 的首个 commit |
 | 「wick 内部不恢复」 | 子进程超时转 `failed`（fix 最坏 1500s + 11×`CHECK_TIMEOUT`）；重排要人手动 `cli.py retry` | `grep -n "finish_event.*failed" src/worker.py`（超时在 `agent.py:327-330` 的 try/except 里抛出，`worker.py:177` 接住写 failed） |
@@ -231,7 +231,7 @@ python eval/check-report.py --selftest # 1 秒：只验解析器本身
 
 - **"必须走 PR"和"agent 不 merge"**：GitHub 的 `required_pull_request_reviews` 要求至少 1 个 approval，而单人仓库里作者不能批准自己的 PR——开了等于把整个仓库锁死。所以没开。
 - 真正的约束是两件事：① **wick 的审批执行路径**里没有 merge——`src/actions.py` 只有 commit / push / PR，2026-11-24 核过，`grep merge src/actions.py` 零匹配；② 人 review 每个 PR。
-- ⚠️ ① 只覆盖审批路径。**agent 自己是带 shell 的 `hermes -z` 子进程**，环境里有 `gh`，理论上有能力 `gh pr merge`；拦住它的是 `src/prompts/issue_fix.md:60` 的提示词禁令，不是代码里没有那条路。把这两件事混成"能力缺失"会高估约束强度（`grep -rn merge src/` 不是零：`issue_fix.md:60` 是禁令，`:64` 只是「merge 后再跟进」的示例）。
+- ⚠️ ① 只覆盖审批路径，**agent 自己拦不住自己** —— 详见 § 验证纪律「写「做不到 X」之前，读一遍兜底路径」那条。
 - 要机制化，需要第二个账号（bot reviewer）或 CI 门禁——都超出当前范围。
 
 **结论**：这条规则是**约定（人 review + prompt 禁令）+ 审批路径里的能力缺失**，不是强制。任何文档都不该把它写成"已经强制"。等真有第二个账号时再改这一节。

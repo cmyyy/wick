@@ -90,7 +90,7 @@ def _commit_prefix(labels: list[str]) -> str:
 
 
 def _pr_body(detail: dict, branch: str, sha: str, number: int | str, repo: str) -> str:
-    """PR body with the three sections CONTRIBUTING requires."""
+    """""PR body with the sections CONTRIBUTING requires."""
     files = detail.get("files") or []
     files_block = "\n".join(f"- `{f}`" for f in files[:20]) or "- （未记录）"
     summary = (detail.get("summary") or "").strip() or "（见 diff）"
@@ -210,7 +210,7 @@ def _selftest() -> int:
     assert _commit_prefix(["Docs"]) == "docs", "label matching must be case-insensitive"
     assert _commit_prefix(["reliability", "docs"]) == "docs", "docs wins over a fix-ish label"
 
-    # The PR body must carry the three sections CONTRIBUTING requires.
+    # The PR body must carry the sections CONTRIBUTING requires.
     body = _pr_body(
         {"files": ["a.py", "b.py"], "diff": "+10/-2", "summary": "改了 a.py 的连接泄漏",
          "checks": "9/9"},
