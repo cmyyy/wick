@@ -372,8 +372,10 @@ def handle_issue_fix(conn, event) -> str:
         # that queued an approval and then lost its lease would still open a PR
         # from a stale worktree.
         "attempts": event["attempts"],
-        # Enough context for the PR body to carry the three sections CONTRIBUTING
-        # asks for, without re-reading the agent's transcript later.
+        # Enough context for the PR body to carry the sections CONTRIBUTING asks for,
+        # without re-reading the agent's transcript later. The 审了什么 section has no
+        # producer here on purpose: review of a change happens after the PR body is
+        # generated, so that section is filled in by a human afterwards, not by this.
         "summary": text[:2000],
         "checks": f"{checks['passed']}/{checks['total']}",
     }, worker_id=event["worker_id"], attempts=event["attempts"])
