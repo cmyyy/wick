@@ -134,7 +134,7 @@ python eval/run.py --selftest
 python src/server.py --selftest
 ```
 
-十一个全绿再提。新增模块时把它的自检加进这份清单，`src/agent.py` 里的 `CHECKS` 也要同步——那是 worker 跑 agent 改动后实际执行的门槛，不同步等于新模块坏了没人管。
+十一个全绿再提（CI 也会在 PR 上跑同一份清单，见下文）。新增模块时把它的自检加进这份清单，`src/agent.py` 里的 `CHECKS` 也要同步——那是 worker 跑 agent 改动后实际执行的门槛，不同步等于新模块坏了没人管。
 
 ## 可靠性验收（改动了 worker / db / outbox 才跑）
 
@@ -146,6 +146,31 @@ python eval/reliability.py --all      # 全跑，任一不通过就非零退出
 ```
 
 这三条是**真进程、真库、真 skill**，不是 mock：`--crash` 会真起 worker 再 `taskkill /F`。所以它们比自检慢得多，只在动到 `worker.py` / `db.py` / `outbox.py` / `agent.py` 的租约或投递逻辑时跑。每条判定后面都跟着产生它的 SQL。
+
+## 生成物不要手改
+
+`eval/report.md` 是 `python eval/reliability.py --all` 的输出，它的判定列由脚本算出来。手改它会被抓出来：
+
+```bash
+python eval/check-report.py            # 约 6 分钟：重跑 --all 到临时路径，比对判定列
+python eval/check-report.py --selftest # 1 秒：只验解析器本身
+```
+
+什么时候跑：
+
+- 改动了 `eval/reliability.py` 的判定逻辑或报告生成
+- 改动了 `eval/report.md`（本来就不该改 —— 跑了就知道）
+- 改动了 `src/` 里影响可靠性结论的东西（worker 租约、`db.requeue_stale`、`outbox` 投递）
+
+它**故意忽略**时间戳和心跳采样区间（每次跑都会变），比对的是「有哪些验收项 + 每项的判定」。
+
+> 为什么单列一节：这条规矩来自一次真实的错。生成的报告里有一句「心跳年龄反复在 2.8–22.9s 之间」，那个区间是手打进生成器字符串的，不是采样出来的 —— 它和同一页表格里的数字对不上，任何人重跑一次就会发现。生成物和它的生成器只允许有一个事实源。
+
+## 自动跑的部分
+
+`.github/workflows/checks.yml` 在 PR 上跑那 11 个自检（14 秒，无依赖、无网络）。不需要谁记得跑。
+
+**没进 CI 的**：`eval/reliability.py --all`（约 6 分钟、要真起进程并 kill 子进程）。它属于「改动上面那几处才跑」的本机检查，用 `check-report.py` 触发。
 
 ## PR 要求
 
