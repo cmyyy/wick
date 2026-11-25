@@ -50,7 +50,10 @@ def handle(conn, event) -> str:
     approval; "analyze" (D3) only reports a plan. Other source types take the
     placeholder path until they have a prompt of their own.
     """
-    if event["source_type"] == "github_issue":
+    if event["source_type"] in ("github_issue", "manual"):
+        # manual is a task I queued by hand (cli.py enqueue, #30). It carries the
+        # same prompt fields as an issue, so it takes the same path -- otherwise
+        # the whole point of queueing it is lost on a placeholder string.
         import agent  # local import: keeps --selftest free of model deps
         if FIX_MODE == "analyze":
             return agent.handle_event(conn, event)
@@ -154,6 +157,17 @@ def _renew_lease(conn, event_id: int, stop: threading.Event) -> None:
             continue
 
 
+def pause_exclusions(conn) -> tuple[str, ...] | None:
+    """Source types to keep out of the claim while paused. The only reader.
+
+    serve() and --once both go through run_once, so the switch is read in exactly
+    one place (#38 S2). run_once asks again before every claim, so pressing pause
+    mid-drain stops the NEXT manual event without cutting the one already running
+    (#38 F2).
+    """
+    return ("manual",) if db.get_meta(conn, "manual_paused") == "1" else None
+
+
 def run_once(conn) -> int:
     """Drain the queue, returning how many events were processed.
 
@@ -164,7 +178,7 @@ def run_once(conn) -> int:
     """
     processed = 0
     while True:
-        ev = db.claim_next(conn, WORKER_ID)
+        ev = db.claim_next(conn, WORKER_ID, exclude_sources=pause_exclusions(conn))
         if ev is None:
             return processed
         stop = threading.Event()
@@ -283,6 +297,28 @@ def _selftest() -> int:
         # An empty queue does nothing.
         assert run_once(conn) == 0
 
+        # F2 (#38): pause must bite on the NEXT claim, not on the next outer loop.
+        # Reading the switch once per loop let run_once drain the rest of the queue
+        # after pause was pressed. Two manual events: the first one presses pause
+        # while it runs, the second must stay pending.
+        def pause_midway(conn, event):
+            db.set_meta(conn, "manual_paused", "1")
+            return f"[test] 处理了 {event['source_id']}"
+
+        handle = pause_midway
+        db.enqueue(conn, "manual", "pause-1", {"title": "跑到一半被暂停"})
+        db.enqueue(conn, "manual", "pause-2", {"title": "下一条该被挡住"})
+        assert run_once(conn) == 1
+        rows = {r["source_id"]: r for r in conn.execute(
+            "SELECT source_id, status, attempts FROM events WHERE source_id LIKE 'pause-%'")}
+        assert rows["pause-1"]["status"] == "done", dict(rows["pause-1"])
+        assert (rows["pause-2"]["status"], rows["pause-2"]["attempts"]) == ("pending", 0), \
+            f"pause 之后的下一条 manual 仍被领走: {dict(rows['pause-2'])}"
+        # The parked row is the point of the test, not part of the queue the rest
+        # of the selftest drains; delete it and restore the switch.
+        conn.execute("DELETE FROM events WHERE source_id='pause-2'")
+        db.set_meta(conn, "manual_paused", "0")  # restore for the rest of the selftest
+        handle = lambda conn, event: f"[test] 处理了 {event['source_id']}"  # noqa: E731
 
         # Lease (issue #1): while handle() is busy, the heartbeat thread renews the
         # claim, so a second worker starting up mid-run reclaims nothing.
@@ -317,7 +353,7 @@ def _selftest() -> int:
         # Restore the plain stub: the lease test above replaced handle() with one
         # that sleeps, and this block patches time.sleep to raise to stop the loop.
         # `original` is the real handler (it would call Hermes), so rebuild the stub.
-        handle = lambda conn, ev: f"[test] 处理了 {ev['source_id']}"  # noqa: E731
+        handle = lambda conn, event: f"[test] 处理了 {event['source_id']}"  # noqa: E731
         import tempfile
         with tempfile.TemporaryDirectory() as td:
             tmp = Path(td)
@@ -473,7 +509,10 @@ def _selftest() -> int:
         with tempfile.TemporaryDirectory() as td:
             once_db = Path(td) / "once.db"
             c2 = db.connect(once_db)
-            db.enqueue(c2, "manual", "stale-once", {"title": "崩溃遗留的那条"})
+            # followup, not manual: manual now takes the real fix path (#30) and a
+            # selftest must not call a model. This case is about --once recovering a
+            # stale claim, which is source-type agnostic.
+            db.enqueue(c2, "followup", "stale-once", {"title": "崩溃遗留的那条"})
             c2.execute("UPDATE events SET status='running', worker_id='dead-worker', "
                        "heartbeat_at=?, attempts=1 WHERE source_id='stale-once'", (stale_ts,))
             c2.commit()
@@ -485,6 +524,38 @@ def _selftest() -> int:
             )
             assert p.returncode == 0, (p.stdout, p.stderr)
             assert "处理了 1 条事件" in p.stdout, p.stdout + p.stderr
+
+        # pause 是逃逸阀，--once 也得认它，否则调试时一个手滑就把挡住的活放出来了。
+        with tempfile.TemporaryDirectory() as td:
+            pdb = Path(td) / "paused.db"
+            c3 = db.connect(pdb)
+            db.enqueue(c3, "manual", "paused-1", {"title": "暂停期间不该被领"})
+            db.set_meta(c3, "manual_paused", "1")
+            c3.commit()
+            c3.close()
+            p = subprocess.run(
+                [sys.executable, str(Path(__file__).parent / "worker.py"),
+                 "--once", "--db", str(pdb)],
+                capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=120,
+            )
+            assert p.returncode == 0, (p.stdout, p.stderr)
+            # S1 (#38): "处理了 0 条事件" is also what a run that FAILED prints
+            # (processed only counts done events), so it cannot tell "pause blocked
+            # it" from "it ran and broke". Ask the DB instead: the row is still
+            # pending, never claimed (attempts=0), and no approval or delivery was
+            # produced.
+            chk = db.connect(pdb)
+            try:
+                row = chk.execute("SELECT status, attempts, worker_id FROM events "
+                                  "WHERE source_id='paused-1'").fetchone()
+                assert (row["status"], row["attempts"], row["worker_id"]) == \
+                    ("pending", 0, None), dict(row)
+                assert chk.execute("SELECT COUNT(*) c FROM approvals").fetchone()["c"] == 0, \
+                    "暂停期间不该写审批"
+                assert chk.execute("SELECT COUNT(*) c FROM deliveries").fetchone()["c"] == 0, \
+                    "暂停期间不该投递（失败也不该投递）"
+            finally:
+                chk.close()
 
         conn.close()
     finally:
@@ -525,8 +596,9 @@ def _selftest() -> int:
         "同一事件第二条审批必须拒绝，否则会开第二个 PR"
     gate.close()
 
-    print("worker.py selftest OK: 进→处理→出 / 去重 / 空队列 / 租约心跳 / 失败隔离 / "
-          "被抢后丢弃结果 / 心跳抖动不断线 / --once 回收 / 审批三道门 / 常驻循环真发出投递")
+    print("worker.py selftest OK: 进→处理→出 / 去重 / 空队列 / pause 逐条生效 / 租约心跳 / "
+          "失败隔离 / 被抢后丢弃结果 / 心跳抖动不断线 / --once 回收且暂停真挡住 / "
+          "审批三道门 / 常驻循环真发出投递")
 
 
     return 0
@@ -564,6 +636,9 @@ def main() -> int:
             ran = process_approvals(conn)
             if ran:
                 print(f"执行了 {ran} 个已批准的动作")
+            # --once goes through run_once, which is the one place that reads the
+            # pause switch (#38 S2); running a one-shot while paused must not pick
+            # up the work the escape hatch was meant to park (#30).
             n = run_once(conn)
             print(f"处理了 {n} 条事件")
             print(f"投递: {outbox.drain(conn)}")

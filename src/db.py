@@ -212,23 +212,34 @@ def schedule_followup(conn: sqlite3.Connection, when: str,
                    {"title": note, "text": note, "due_at": ts}, due_at=ts)
 
 
-def claim_next(conn: sqlite3.Connection, worker_id: str) -> sqlite3.Row | None:
+def claim_next(conn: sqlite3.Connection, worker_id: str, *,
+               exclude_sources: tuple[str, ...] | None = None) -> sqlite3.Row | None:
     """Atomically claim one pending event that is due now.
 
     Stamps worker_id and the starting heartbeat, which is the lease: other
     workers may only take it back once this one stops beating. None if nothing
     is due. due_at IS NULL is the pre-#14 row (due immediately); COALESCE keeps
     the old id order for those and puts them ahead of scheduled ones.
+
+    exclude_sources keeps listed source types out of the claim, which is how
+    `cli.py pause` parks manual work without deleting it (#30).
     """
     ts = now()
+    where = "status='pending' AND (due_at IS NULL OR due_at <= ?)"
+    # Param order follows the statement, not the code: SET wants worker_id then two
+    # timestamps, and the WHERE clause wants due_at before the NOT IN list.
+    params: list[Any] = [worker_id, ts, ts, ts]
+    if exclude_sources:
+        where += f" AND source_type NOT IN ({','.join('?' * len(exclude_sources))})"
+        params.extend(exclude_sources)
     row = conn.execute(
         "UPDATE events SET status='running', worker_id=?, heartbeat_at=?, "
         "attempts=attempts+1, updated_at=? "
         "WHERE id = (SELECT id FROM events "
-        "            WHERE status='pending' AND (due_at IS NULL OR due_at <= ?) "
+        f"            WHERE {where} "
         "            ORDER BY COALESCE(due_at, ''), id LIMIT 1) "
         "RETURNING *",
-        (worker_id, ts, ts, ts),
+        params,
     ).fetchone()
     conn.commit()
     return row

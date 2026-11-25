@@ -3,7 +3,7 @@
 ## issue 内容
 
 - 仓库：`{repo}`
-- 编号：#{number}
+- 编号：{issue_ref}
 - 标题：{title}
 - 链接：{url}
 - 标签：{labels}

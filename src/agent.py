@@ -30,6 +30,10 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 PROMPT_DIR = Path(__file__).resolve().parent / "prompts"
 HERMES_BIN = os.environ.get("WICK_HERMES_BIN", "hermes")
+# The subprocess that writes code runs as its own bot, not as the orchestrator:
+# separate profile means separate memory, so it cannot mistake the orchestrator's
+# assumptions for evidence (#30).
+HERMES_PROFILE = os.environ.get("WICK_HERMES_PROFILE", "wick-dev")
 DEFAULT_TIMEOUT = 900      # seconds; a real code-reading run can take minutes
 FIX_TIMEOUT = 1500         # editing plus testing takes longer than pure analysis
 CHECK_TIMEOUT = 300
@@ -69,13 +73,18 @@ def _render(template: str, payload: dict,
     Two slots, not one: the index describes OTHER in-flight tasks and must not
     be mistaken for this task's history. When task_text is empty the template's
     "first run" marker goes in -- a new task is never told it is a continuation.
+
+    `issue_ref` carries the honest reference: "#12" for an issue, a plain label for
+    a hand-queued task that has no number -- never "#?" (#38 F3).
     """
     tpl = (PROMPT_DIR / template).read_text(encoding="utf-8")
     index_text, task_text = progress
     labels = ", ".join(payload.get("labels") or []) or "(无)"
+    number = payload.get("number")
     return tpl.format(
         repo=payload.get("repo", "?"),
-        number=payload.get("number", "?"),
+        number=number if number else "?",
+        issue_ref=f"#{number}" if number else "（手派任务，无编号）",
         title=payload.get("title", "(无标题)"),
         url=payload.get("url", ""),
         labels=labels,
@@ -93,10 +102,24 @@ def render_issue_prompt(payload: dict, progress: tuple[str, str] = ("", "")) -> 
     return _render("issue.md", payload, progress)
 
 
+def _scope_text(payload: dict) -> str:
+    """What this run is allowed to change (#38 F6, decision §3).
+
+    The gray release starts on docs and copy. A run without --allow-code is told
+    to stay out of src/ in the prompt, and handle_issue_fix fails it loudly if it
+    goes in anyway -- the gate is visible, not a classifier.
+    """
+    if payload.get("allow_code"):
+        return "本任务允许改 `src/` 下的代码（派活时给了 --allow-code）。仍然只改必要的地方。"
+    return ("本任务**不允许改 `src/` 下的代码**（派活时没给 --allow-code）：只允许改 `*.md`、"
+            "文档和文案。如果你判断必须改代码，停下来在输出里说明，不要改。")
+
+
 def render_fix_prompt(payload: dict, worktree: Path, branch: str,
                       progress: tuple[str, str] = ("", "")) -> str:
     """Fix prompt pointing the agent at its own worktree (D4)."""
-    return _render("issue_fix.md", payload, progress, worktree=str(worktree), branch=branch)
+    return _render("issue_fix.md", payload, progress, worktree=str(worktree),
+                   branch=branch, scope=_scope_text(payload))
 
 
 def run_prompt(prompt: str, cwd: str | Path | None = None,
@@ -108,7 +131,7 @@ def run_prompt(prompt: str, cwd: str | Path | None = None,
     """
     try:
         p = subprocess.run(
-            [HERMES_BIN, "-z", prompt],
+            [HERMES_BIN, "-p", HERMES_PROFILE, "-z", prompt],
             cwd=str(cwd or PROJECT_ROOT),
             capture_output=True,
             text=True,
@@ -186,16 +209,24 @@ def _checks_line(checks: dict) -> str:
 
 def compose_fix_report(payload: dict, text: str, run_error: Exception | None,
                        checks: dict, changes: dict, worktree: Path, branch: str,
-                       approval_id: int | None = None) -> str:
+                       approval_id: int | None = None, no_changes: bool = False) -> str:
     verdict = verdict_of(text, "fix") if text else None
+    number = payload.get("number")
+    target = (f"{payload.get('repo','?')}#{number}" if number
+              else f"{payload.get('repo','?')}（手派任务）")
     head = [
-        f"针对 {payload.get('repo','?')}#{payload.get('number','?')} {payload.get('title','')}",
+        f"针对 {target} {payload.get('title','')}",
         f"判定：{verdict or '（agent 未按格式输出）'}",
         f"分支：{branch}",
         f"worktree：{worktree}",
         f"改动：{changes['file_count']} 个文件 +{changes['lines_added']}/-{changes['lines_removed']}",
         f"自检：{_checks_line(checks)}",
     ]
+    if no_changes:
+        # F4 (#38) 方案 B: a read-only task (review/analysis) legitimately produces
+        # no diff. Asking for approval to open a PR would only create a waiting row
+        # that fails at commit_and_push -- the report itself is the deliverable.
+        head.append("结果：没有改动可以提 PR —— 只读任务的报告就是产出，本次不写审批")
     if approval_id is not None:
         head.append(f"待批准：审批 #{approval_id}（{_ACTION_LABEL}）— 什么都没提交，等你点头")
     if changes["file_count"]:
@@ -306,6 +337,11 @@ def handle_issue_fix(conn, event) -> str:
     a PR. On success it writes a `waiting` approval row and returns a report
     telling the user how to approve it.
 
+    Two exceptions to "always ask" (#38): a run that changed nothing gets a report
+    but no approval (a read-only task has nothing to PR -- F4/B), and a run that
+    touched src/ without --allow-code fails loudly instead of quietly widening the
+    gray release (F6).
+
     Raises when the run failed or the self-checks did not all pass, so a broken
     run is recorded as failed even if the agent claims otherwise.
     """
@@ -314,7 +350,7 @@ def handle_issue_fix(conn, event) -> str:
     import sandbox
 
     payload = json.loads(event["payload"] or "{}")
-    number = payload.get("number", "?")
+    number = payload.get("number")
     task = progressmod.task_id(event)
     guard = (event["id"], event["attempts"], event["worker_id"])
     worktree, branch = sandbox.create(PROJECT_ROOT, event["id"], number,
@@ -336,11 +372,19 @@ def handle_issue_fix(conn, event) -> str:
     checks = run_checks(worktree)
     changes = sandbox.diff(PROJECT_ROOT, worktree)
 
+    # F6: without --allow-code the run may only touch docs and copy. This is a
+    # visible gate, not a classifier: the prompt says it, and a src/ change fails
+    # the run below with the paths named.
+    blocked = [] if payload.get("allow_code") else [
+        f for f in changes["files"] if f == "src" or f.startswith("src/")]
+
     # Write the trace before the raises below: a failed or half-done run is
     # exactly what the next round has to know about. The worktree is thrown
     # away, this file is not. The patch goes in because the next attempt starts
     # from a clean tree -- the note is the only way it can see what was changed.
     leftover = leftover_of(text)
+    if blocked:
+        leftover = f"闸门：没加 --allow-code 却改了 src/（{', '.join(blocked[:3])}）；{leftover}"
     if run_error is not None:
         leftover = f"上次运行失败（{run_error}）；{leftover}"
     progressmod.append(task, verdict=verdict_of(text, "fix") if text else None,
@@ -356,6 +400,16 @@ def handle_issue_fix(conn, event) -> str:
         raise RuntimeError(
             compose_fix_report(payload, text, None, checks, changes, worktree, branch)
         )
+    if blocked:
+        raise RuntimeError(
+            compose_fix_report(payload, text, None, checks, changes, worktree, branch)
+            + f"\n\n闸门：本任务没有加 --allow-code，只允许改文档/文案，但改动了 "
+              f"{', '.join(blocked)}。改动留在 worktree 里；确认要改代码就重派时加 --allow-code。"
+        )
+    if not changes["file_count"]:
+        # F4/B (#38): 0 改动不再是「一条注定失败的提 PR 审批」，报告就是产出。
+        return compose_fix_report(payload, text, None, checks, changes, worktree, branch,
+                                  no_changes=True)
 
     approval_id = dbmod.request_approval(conn, event["id"], _ACTION_LABEL, {
         "repo": payload.get("repo"),
@@ -416,6 +470,18 @@ def _selftest() -> int:
     assert str(wt_path) in fix and "wick/issue-7-run-3" in fix
     for must in ("git commit", "git push", "python src/db.py", "判定：<已修复"):
         assert must in fix, must
+    # F6 (#38): without --allow-code the prompt itself must park the run in docs.
+    assert "不允许改 `src/`" in fix, "没加 --allow-code 时 prompt 没限制 src/"
+    assert "允许改 `src/`" in render_fix_prompt({**payload, "allow_code": True},
+                                                wt_path, "wick/issue-7-run-3")
+
+    # F3 (#38): a hand-queued task has no number -- the prompt says so instead of
+    # rendering "#?" as if it were a real issue reference.
+    hand = {"repo": "cmyyy/wick", "title": "PR #29 判据再验一遍"}
+    for rendered in (render_issue_prompt(hand),
+                     render_fix_prompt(hand, wt_path, "wick/issue-manual-run-1-attempt-1")):
+        assert "（手派任务，无编号）" in rendered, rendered[:300]
+        assert "#?" not in rendered and "编号：#?" not in rendered
 
     # Progress is a note written by a previous run, never an authority. Both
     # templates must say so: delete the sentence and this goes red.
@@ -519,7 +585,8 @@ def _selftest() -> int:
 
     fconn = dbmod.connect(":memory:")
     dbmod.enqueue(fconn, "github_issue", "cmyyy/wick#12",
-                  {"repo": "cmyyy/wick", "number": 12, "title": "outbox 重复投递"})
+                  {"repo": "cmyyy/wick", "number": 12, "title": "outbox 重复投递",
+                   "allow_code": True})
     fevent = dbmod.claim_next(fconn, "w-fix")
     assert fevent is not None
 
@@ -566,6 +633,37 @@ def _selftest() -> int:
                          "部分修复", "标记 sent 再提交"):
                 assert must in second, (must, second[:600])
             assert NO_PROGRESS not in second, "第二轮还说这是第一次运行"
+
+            # F4/B (#38): a read-only task changes nothing. It must NOT queue a
+            # "提 PR" approval that is guaranteed to fail at commit_and_push --
+            # the report is the deliverable.
+            def zero_diff(repo, worktree, base="HEAD"):
+                return {"file_count": 0, "files": [], "lines_added": 0,
+                        "lines_removed": 0, "patch_lines": 0, "patch": ""}
+
+            sandbox.diff = zero_diff
+            before = fconn.execute("SELECT COUNT(*) c FROM approvals").fetchone()["c"]
+            report = handle_issue_fix(fconn, fevent)
+            assert "没有改动可以提 PR" in report, report[:400]
+            assert fconn.execute("SELECT COUNT(*) c FROM approvals").fetchone()["c"] == before, \
+                "0 改动不该写审批"
+
+            # F6 (#38): src/ changes without --allow-code must fail the run loudly
+            # and write no approval -- that is the gray-release gate.
+            dbmod.enqueue(fconn, "github_issue", "cmyyy/wick#13",
+                          {"repo": "cmyyy/wick", "number": 13, "title": "没加 --allow-code"})
+            gate_event = dbmod.claim_next(fconn, "w-gate")
+            assert gate_event is not None
+            sandbox.diff = fake_diff  # src/outbox.py
+            try:
+                handle_issue_fix(fconn, gate_event)
+            except RuntimeError as exc:
+                assert "闸门" in str(exc) and "--allow-code" in str(exc), str(exc)[:500]
+            else:
+                raise AssertionError("没加 --allow-code 却改了 src/，应该失败")
+            assert fconn.execute("SELECT COUNT(*) c FROM approvals WHERE event_id=?",
+                                 (gate_event["id"],)).fetchone()["c"] == 0, \
+                "闸门命中时不该写审批"
         finally:
             (progressmod.PROGRESS_DIR, run_prompt, run_checks,
              sandbox.create, sandbox.diff) = saved
@@ -649,7 +747,8 @@ def _selftest() -> int:
         assert "src/db.py" in _checks_line(checks)
 
     print("agent.py selftest OK: 模板渲染 / 判定解析 / 进度两槽且不是权威 / 下次跟进入队与去重 / 自检真能失败 / "
-          "分析路径两轮看到上一轮报告 / fix 路径经 handle_issue_fix 注入上一轮文件·自检·遗留·patch")
+          "分析路径两轮看到上一轮报告 / fix 路径经 handle_issue_fix 注入上一轮文件·自检·遗留·patch / "
+          "无编号不渲染 #? / 0 改动不写审批 / 没加 --allow-code 改 src/ 会失败")
     return 0
 
 

@@ -10,17 +10,26 @@ Usage:
     python src/cli.py reject <id>
     python src/cli.py retry <event_id>
     python src/cli.py schedule <ISO 时间> <做什么>
+    python src/cli.py enqueue --title "改什么" [--repo owner/name] [--number 12] [--allow-code]
+    python src/cli.py pause [--off]
     python src/cli.py panel [--port 9119]
 """
 from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
+import uuid
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 import db  # noqa: E402
+
+# The only repo this worker can safely change: sandbox.create() and git push both
+# use this checkout's own root, so a --repo pointing elsewhere would edit the
+# wrong repo (#38 F5). Override only if the checkout itself moved.
+SELF_REPO = os.environ.get("WICK_REPO", "cmyyy/wick")
 
 
 def connect(args):
@@ -163,6 +172,64 @@ def cmd_schedule(args) -> int:
         conn.close()
 
 
+def cmd_enqueue(args) -> int:
+    """Queue a task by hand so the worker picks it up like any other event (#30).
+
+    source_id defaults to timestamp + random suffix. db.now() alone only has
+    second resolution, and dedupe_key is UNIQUE: two dispatches in the same
+    second silently collapsed into one row (#38 F1). Pass --id to deliberately
+    re-use an id and hit dedupe.
+
+    --repo is checked, not just recorded: the worktree and the push are pinned to
+    this checkout, so accepting another repo would quietly edit the wrong one
+    (#38 F5). --allow-code is the gray-release gate: without it the run is told
+    to stay in docs/copy, and touching src/ fails the run loudly (#38 F6).
+    """
+    if args.repo and args.repo != SELF_REPO:
+        print(f"--repo 只支持本仓库 {SELF_REPO}（worktree 与 push 都指向它）；"
+              f"{args.repo} 会改错仓，已拒绝", file=sys.stderr)
+        return 1
+    conn = connect(args)
+    try:
+        sid = args.id or f"{db.now()}-{uuid.uuid4().hex[:6]}"
+        payload = {"title": args.title}
+        if args.repo:
+            payload["repo"] = args.repo
+        if args.number:
+            payload["number"] = args.number
+        if getattr(args, "allow_code", False):
+            payload["allow_code"] = True
+        eid, created = db.enqueue(conn, "manual", sid, payload)
+        conn.commit()
+        if created:
+            gate = "" if payload.get("allow_code") else "（未加 --allow-code：只允许改文档/文案）"
+            print(f"已派活 #{eid}（manual:{sid}）：{args.title}{gate}")
+        else:
+            print(f"已存在 #{eid}（dedupe 命中，未重复入队）：{args.title}")
+        return 0
+    finally:
+        conn.close()
+
+
+def cmd_pause(args) -> int:
+    """Stop handing out manual work; other sources keep running (#30).
+
+    A switch in meta, not a deleted row: the queued work stays queued and resumes
+    where it was, which is what makes this a usable escape hatch.
+    """
+    conn = connect(args)
+    try:
+        db.set_meta(conn, "manual_paused", "0" if args.off else "1")
+        conn.commit()
+        if args.off:
+            print("已恢复：manual 派活会重新被领走")
+        else:
+            print("已暂停：manual 派活不再被领走（已入队的还在，--off 恢复）")
+        return 0
+    finally:
+        conn.close()
+
+
 def cmd_panel(args) -> int:
     """Serve the D8 page (src/server.py). Blocks until Ctrl+C."""
     import server
@@ -175,7 +242,7 @@ def _selftest() -> int:
     """Self-check: status counts, pending list, and approve once-and-only-once."""
     import io
     import tempfile
-    from contextlib import redirect_stdout
+    from contextlib import redirect_stderr, redirect_stdout
 
     # ignore_cleanup_errors: on Windows the sqlite WAL/SHM files of a just-closed
     # connection can still be held for a moment, which made cleanup raise after
@@ -198,10 +265,67 @@ def _selftest() -> int:
         conn.close()
 
         def run(fn, **kw) -> tuple[int, str]:
+            # stderr goes into the same buffer: a refused command explains itself
+            # there, and the assertions below need to see that text too.
             buf = io.StringIO()
-            with redirect_stdout(buf):
+            with redirect_stdout(buf), redirect_stderr(buf):
                 rc = fn(argparse.Namespace(db=str(path), **kw))
             return rc, buf.getvalue()
+
+        # enqueue (#30): a hand-queued task lands as a manual event the worker can
+        # claim, and the same call twice is deduped rather than silently doubled.
+        rc, out = run(cmd_enqueue, title="改一下 CONFIG 注释", repo="cmyyy/wick", number=None, id="固定-id")
+        assert rc == 0 and "已派活" in out, out
+        rc2, out2 = run(cmd_enqueue, title="改一下 CONFIG 注释", repo="cmyyy/wick", number=None, id="固定-id")
+        assert rc2 == 0 and "dedupe 命中" in out2, out2
+        c = db.connect(path)
+        row = c.execute("SELECT source_type, source_id, payload FROM events "
+                        "WHERE source_id='固定-id'").fetchone()
+        assert row["source_type"] == "manual", row["source_type"]
+        assert json.loads(row["payload"])["title"] == "改一下 CONFIG 注释"
+
+        # F1 (#38): db.now() only has second resolution, so two dispatches in one
+        # second used to collapse into a single row. Pin the clock and dispatch
+        # twice with no --id: both must land.
+        real_now = db.now
+        db.now = lambda: "2026-11-25T00:00:00+00:00"
+        try:
+            rc, out = run(cmd_enqueue, title="同秒第一条", repo=None, number=None, id=None)
+            assert rc == 0 and "已派活" in out, out
+            rc, out = run(cmd_enqueue, title="同秒第二条", repo=None, number=None, id=None)
+            assert rc == 0 and "已派活" in out, out
+        finally:
+            db.now = real_now
+        same_second = c.execute(
+            "SELECT COUNT(*) c FROM events WHERE source_type='manual' "
+            "AND json_extract(payload, '$.title') LIKE '同秒第%'").fetchone()["c"]
+        assert same_second == 2, f"同秒派两条只入队了 {same_second} 条"
+
+        # F5 (#38): --repo is not decoration. A foreign repo is refused outright,
+        # because the worktree and the push are pinned to this checkout.
+        rc, out = run(cmd_enqueue, title="改别的仓", repo="someone/else", number=None, id=None)
+        assert rc == 1 and "已拒绝" in out, out
+        assert c.execute("SELECT COUNT(*) c FROM events WHERE "
+                         "json_extract(payload, '$.title')='改别的仓'").fetchone()["c"] == 0
+
+        # F6 (#38): the gray-release gate is recorded in the payload, so the run
+        # itself can refuse src/ changes; enqueue says so out loud.
+        rc, out = run(cmd_enqueue, title="只改文档", repo=None, number=None, id=None, allow_code=False)
+        assert rc == 0 and "--allow-code" in out, out
+        rc, out = run(cmd_enqueue, title="改代码", repo=None, number=None, id=None, allow_code=True)
+        assert rc == 0 and "未加 --allow-code" not in out, out
+        gate_row = c.execute("SELECT payload FROM events WHERE "
+                             "json_extract(payload, '$.title')='改代码'").fetchone()
+        assert json.loads(gate_row["payload"]).get("allow_code") is True, gate_row["payload"]
+
+        # pause (#30): excluding manual must not hide a github_issue sitting in the
+        # same queue -- otherwise the escape hatch is just a stop button.
+        db.enqueue(c, "github_issue", "cmyyy/wick#99", {"title": "issue 那条"})
+        c.commit()
+        got = db.claim_next(c, "cli-selftest", exclude_sources=("manual",))
+        assert got is not None and got["source_type"] == "github_issue", dict(got) if got else None
+        c.close()
+        assert not [r for r in db.connect(path).execute("SELECT id FROM events WHERE source_id='固定-id' AND status='running'")]
 
         rc, out = run(cmd_status)
         assert rc == 0 and "events" in out and "deliveries" in out, out
@@ -274,6 +398,17 @@ def main() -> int:
     p.add_argument("when", help="ISO 时间，如 2026-11-23T09:00:00+08:00（不带偏移按本机时区）")
     p.add_argument("what", help="到时候做什么")
     p.set_defaults(func=cmd_schedule)
+    p = sub.add_parser("enqueue", help="派一条活给 worker（issue #30）")
+    p.add_argument("--title", required=True, help="要做什么")
+    p.add_argument("--repo", default=None, help=f"owner/name（只支持本仓库 {SELF_REPO}）")
+    p.add_argument("--number", type=int, default=None, help="关联的 issue 号（可选）")
+    p.add_argument("--id", default=None, help="source_id（默认时间戳+随机后缀；同名重派需显式给）")
+    p.add_argument("--allow-code", action="store_true",
+                   help="允许改 src/ 下的代码（默认只允许改文档/文案）")
+    p.set_defaults(func=cmd_enqueue)
+    p = sub.add_parser("pause", help="暂停/恢复 manual 派活")
+    p.add_argument("--off", action="store_true", help="恢复派活")
+    p.set_defaults(func=cmd_pause)
     p = sub.add_parser("panel", help="起本地面板（D8）")
     p.add_argument("--port", type=int, default=9119, help="监听端口（0 = 让 OS 分配）")
     p.add_argument("--db", default=None, help="数据库路径（默认 WICK_DB 或 ~/.wick/wick.db）")
