@@ -248,6 +248,12 @@ agent 自己也能排：fix / analyze 两个模板的输出槽 `下次跟进：<
 
 ---
 
+## 故障排查
+
+**`python src/cli.py pause` 之后 GitHub issue 还在被领走。** `pause` 只挡 manual 派活，不是停机开关：`worker.py:168` 的 `pause_exclusions()` 只把 `manual` 排除在 `claim_next` 之外，而 `serve()` 里的 GitHub 轮询（`worker.py:238-243`）根本不看这个开关，`github_issue` 事件照常入队、照常被领走。要全停得停掉 worker 进程本身（前台 `Ctrl+C`，或 `taskkill /F /PID <pid>`）；只想让它继续消费队列、不轮询 GitHub，就别传 `--repo`。`python src/cli.py status` 里 `github_issue` 还在涨，就是这个原因。
+
+---
+
 ## 代码约定
 
 - **注释和 docstring 一律英文**，包括行内注释和模块说明。代码是给所有读者看的，中文注释会把非中文读者挡在外面。
