@@ -89,14 +89,27 @@ def _commit_prefix(labels: list[str]) -> str:
     return "fix"
 
 
-def _pr_body(detail: dict, branch: str, sha: str, number: int | str, repo: str) -> str:
-    """""PR body with the sections CONTRIBUTING requires."""
+def _ref_suffix(number) -> str:
+    """' (#12)' when there is an issue number, '' for a hand-queued task.
+
+    A manual task has no number, and `(#?)` in a commit subject or PR title is a
+    reference to nothing (#38 F3). Placeholder values count as "no number".
+    """
+    return f" (#{number})" if number not in (None, "", "?") else ""
+
+
+def _pr_body(detail: dict, branch: str, sha: str, number: int | str | None, repo: str) -> str:
+    """PR body with the sections CONTRIBUTING requires."""
     files = detail.get("files") or []
     files_block = "\n".join(f"- `{f}`" for f in files[:20]) or "- （未记录）"
     summary = (detail.get("summary") or "").strip() or "（见 diff）"
     checks = detail.get("checks") or "?"
+    # No number means a hand-queued task, not a missing value to paper over:
+    # writing `Closes #?` would make the PR body claim a link it does not have
+    # (#38 F3). Omit the line instead of printing a placeholder.
+    closes = f"Closes #{number}\n\n" if number not in (None, "", "?") else ""
     return (
-        f"Closes #{number}\n\n"
+        f"{closes}"
         f"## 改了什么\n\n{summary}\n\n"
         f"改动文件（{len(files)} 个，{detail.get('diff', '?')}）：\n\n{files_block}\n\n"
         f"## 怎么验证的\n\n"
@@ -122,8 +135,9 @@ def execute_approval(approval: dict, worktree: Path) -> dict:
     repo = approval["repo"]
     branch = approval["branch"]
     base = approval.get("base", "main")
-    number = approval.get("number", "?")
-    title = approval.get("title") or f"issue #{number}"
+    number = approval.get("number")
+    ref = _ref_suffix(number)
+    title = approval.get("title") or (f"issue #{number}" if number else "手派任务")
     prefix = _commit_prefix(approval.get("labels") or [])
 
     if action not in ("提 PR", "open_pr"):
@@ -134,13 +148,13 @@ def execute_approval(approval: dict, worktree: Path) -> dict:
 
     sha = commit_and_push(
         worktree, branch,
-        f"{prefix}: {title} (#{number})\n\n"
+        f"{prefix}: {title}{ref}\n\n"
         f"Automated by wick after a human approved the action.\n"
         f"Approved action: {action}\n",
     )
     url = open_pr(
         worktree, repo, branch, base,
-        f"{prefix}: {title} (#{number})",
+        f"{prefix}: {title}{ref}",
         _pr_body(approval, branch, sha, number, repo),
     )
     return {"commit": sha, "url": url}
@@ -237,8 +251,17 @@ def _selftest() -> int:
     # And it sits between 怎么验证的 and 遗留, which is where a reviewer of the PR looks.
     assert bare.index("## 怎么验证的") < bare.index("## 审了什么") < bare.index("## 遗留")
 
+    # F3 (#38): a hand-queued task has no issue number. Omitting it must drop the
+    # `Closes #?` line and every `(#?)` placeholder, not ship a link to nothing.
+    no_number = _pr_body({"files": ["a.md"], "summary": "改了文档"},
+                         "wick/issue-manual-run-1-attempt-1", "sha1", None, "cmyyy/wick")
+    assert "Closes" not in no_number and "#?" not in no_number, no_number[:300]
+    assert no_number.startswith("## 改了什么"), no_number[:80]
+    assert _ref_suffix(None) == "" and _ref_suffix("?") == "" and _ref_suffix("") == ""
+    assert _ref_suffix(12) == " (#12)"
+
     print("actions.py selftest OK: 空提交拒绝 / commit+push 落地 / 未知动作拒绝 / "
-          "commit 前缀按 label / PR body 四节（含无 review 时的未填写）")
+          "commit 前缀按 label / PR body 四节（含无 review 时的未填写） / 无编号时不写 Closes #?")
     return 0
 
 
