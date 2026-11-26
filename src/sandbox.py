@@ -31,6 +31,20 @@ def _git(repo: Path, *args: str, timeout: int = 120) -> tuple[int, str]:
     return p.returncode, (p.stdout or "") + (p.stderr or "")
 
 
+def _ref_token(value: int | str) -> str:
+    """Turn a value into a token git accepts inside a branch name.
+
+    A hand-queued task (#30) has no issue number, so this arrives as "?" -- and
+    git rejects "?" in a ref. `..` is rejected too, so collapsing dot runs is not
+    cosmetic: the old regex kept dots, and `wick/issue-..-run-7-attempt-2` fails
+    `git check-ref-format` (#38 S3). Everything outside [0-9A-Za-z._-] becomes
+    "-", consecutive dots collapse to one, and leading/trailing dots are dropped.
+    """
+    safe = re.sub(r"[^0-9A-Za-z._-]+", "-", str(value))
+    safe = re.sub(r"\.{2,}", ".", safe)
+    return safe.strip("-.") or "manual"
+
+
 def branch_name(event_id: int, issue_number: int | str, attempt: int) -> str:
     """Branch for one attempt of one event.
 
@@ -39,7 +53,11 @@ def branch_name(event_id: int, issue_number: int | str, attempt: int) -> str:
     must never land on the worktree a stalled attempt is still editing -- so the
     attempt gets its own path AND its own branch (issue #1).
     """
-    return f"wick/issue-{issue_number}-run-{event_id}-attempt-{attempt}"
+    # Sanitize here rather than at each caller: sandbox.create() is the only
+    # producer of refs in the system, and the selftest proves the result against
+    # `git check-ref-format` for hostile inputs, not against this regex.
+    safe = _ref_token(issue_number)
+    return f"wick/issue-{safe}-run-{event_id}-attempt-{attempt}"
 
 
 def create(repo: Path, event_id: int, issue_number: int | str, base: str = "HEAD",
@@ -118,7 +136,20 @@ def prune(repo: Path, keep_pattern: str | None = None) -> list[str]:
 
 def _selftest() -> int:
     """Self-check: create -> edit -> diff -> remove, against a throwaway repo."""
+    import subprocess as sp
     import tempfile
+
+    # A hand-queued task (#30) has no issue number: it arrives as "?" and git
+    # rejects "?" in a ref. #38 S3: the old regex kept dots, so ".." produced
+    # `wick/issue-..-run-7-attempt-2`, which git rejects. Check every hostile
+    # input against git itself rather than against our own regex.
+    for odd_input in ("?", "..", "a..b", ".", "...", "?..?", "12.5", "a b/c"):
+        odd = branch_name(7, odd_input, 2)
+        chk = sp.run(["git", "check-ref-format", "--branch", odd],
+                     capture_output=True, text=True)
+        assert chk.returncode == 0, f"branch_name({odd_input!r}) 产出了 git 不接受的名: {odd}"
+        assert ".." not in odd and "?" not in odd, odd
+    assert branch_name(7, 123, 1) == "wick/issue-123-run-7-attempt-1"
 
     global WORKTREE_ROOT
     with tempfile.TemporaryDirectory() as td:
