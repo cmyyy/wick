@@ -302,9 +302,15 @@ def _selftest() -> int:
         assert same_second == 2, f"同秒派两条只入队了 {same_second} 条"
 
         # F5 (#38): --repo is not decoration. A foreign repo is refused outright,
-        # because the worktree and the push are pinned to this checkout.
-        rc, out = run(cmd_enqueue, title="改别的仓", repo="someone/else", number=None, id=None)
+        # because the worktree and the push are pinned to this checkout -- and the
+        # refusal has to be a non-zero exit code, or the caller (a script now, the
+        # worker later) cannot tell "dispatched" from "refused": a printed refusal
+        # plus rc 0 looks like success to every shell.
+        before = c.execute("SELECT COUNT(*) c FROM events").fetchone()["c"]
+        rc, out = run(cmd_enqueue, title="改别的仓", repo="other/repo", number=None, id=None)
         assert rc == 1 and "已拒绝" in out, out
+        after = c.execute("SELECT COUNT(*) c FROM events").fetchone()["c"]
+        assert after == before, f"被拒绝的派活还是写进了 events 表：{before} -> {after} 行"
         assert c.execute("SELECT COUNT(*) c FROM events WHERE "
                          "json_extract(payload, '$.title')='改别的仓'").fetchone()["c"] == 0
 
