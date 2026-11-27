@@ -19,9 +19,15 @@ GH_CANDIDATES = [
     str(Path.home() / "AppData" / "Local" / "gh-cli" / "bin" / "gh.exe"),
     "gh",
 ]
-# github.com is unreachable without the local proxy on this machine; the API and
-# `gh pr create` both go through it. Empty string means "leave the env alone".
+# github.com is unreachable without the local proxy on this machine; `git push`
+# goes through it. api.github.com is the opposite: the proxy refuses to CONNECT
+# there, so `gh` has to reach it directly (#40 T1). One HTTPS_PROXY cannot serve
+# both, hence a per-program NO_PROXY instead of a global one.
+# Empty string means "leave the env alone".
 PROXY = os.environ.get("WICK_GITHUB_PROXY", "http://127.0.0.1:7890")
+# The one host `gh` must bypass the proxy for. Only `gh` gets it: git needs the
+# proxy for github.com, and excluding both would break the push instead.
+GH_DIRECT_HOST = "api.github.com"
 
 
 def _gh_bin() -> str:
@@ -33,25 +39,107 @@ def _gh_bin() -> str:
     raise RuntimeError("找不到 gh CLI（设 WICK_GH_BIN 或装 GitHub CLI）")
 
 
-def _run(args: list[str], cwd: Path | str, timeout: int = 180) -> str:
+def _is_gh(argv0: str) -> bool:
+    """Is this executable gh? The proxy rule differs per program, so the child's
+    env is decided by what is being run, not by who called `_run`."""
+    return Path(argv0).name.lower().removesuffix(".exe") == "gh"
+
+
+def _child_env(argv0: str) -> dict:
+    """Env for one child process, keyed on the program it runs.
+
+    `git push` keeps the proxy (github.com is only reachable through it); `gh`
+    gets NO_PROXY=api.github.com so it talks to the API directly (#40 T1). Both
+    keep HTTPS_PROXY -- the fix is an exemption, not a removal.
+    """
     env = {**os.environ}
-    if PROXY:
-        env.setdefault("HTTPS_PROXY", PROXY)
-        env.setdefault("HTTP_PROXY", PROXY)
+    if not PROXY:
+        return env
+    env.setdefault("HTTPS_PROXY", PROXY)
+    env.setdefault("HTTP_PROXY", PROXY)
+    if _is_gh(argv0):
+        # Merge with whatever NO_PROXY the caller already exported: clobbering it
+        # would silently widen the exemption for everything else gh calls.
+        hosts = [h.strip() for h in (env.get("NO_PROXY") or "").split(",") if h.strip()]
+        if GH_DIRECT_HOST not in [h.lower() for h in hosts]:
+            hosts.insert(0, GH_DIRECT_HOST)
+        # gh is a Go program: it reads both spellings, so set both.
+        for key in ("NO_PROXY", "no_proxy"):
+            env[key] = ",".join(hosts)
+    return env
+
+
+def _run(args: list[str], cwd: Path | str, timeout: int = 180) -> str:
     p = subprocess.run(args, cwd=str(cwd), capture_output=True, text=True,
-                       encoding="utf-8", errors="replace", timeout=timeout, env=env)
+                       encoding="utf-8", errors="replace", timeout=timeout,
+                       env=_child_env(args[0]))
     out = ((p.stdout or "") + (p.stderr or "")).strip()
     if p.returncode != 0:
         raise RuntimeError(f"{' '.join(args[:3])} 失败（{p.returncode}）: {out[-600:]}")
     return out
 
 
+def _already_committed(worktree: Path, branch: str) -> bool:
+    """Does HEAD already carry the commit this approval was meant to make?
+
+    The "nothing staged" branch below is reached in three states, and only the
+    last one is a real no-op (#40 T2):
+
+    * `origin/<branch>` == HEAD: the commit AND the push landed and only
+      `open_pr` died. This is the state the first real run got stuck in --
+      re-running used to raise forever with the work already on the remote --
+      so it must hand back that sha for the PR step.
+    * HEAD ahead of `origin/<branch>` (or of every remote, when the push never
+      landed): the commit exists, the push does not; finish it.
+    * neither: nothing was committed here at all, and an empty commit would lie.
+
+    A branch freshly cut from main has no `origin/<branch>` and no commit of its
+    own, so it stays in the last bucket even though HEAD == origin/main. That is
+    why the comparison is against the branch's own remote ref, not "any remote".
+    """
+    def git(*args: str) -> str | None:
+        p = subprocess.run(["git", *args], cwd=str(worktree), capture_output=True,
+                           text=True, encoding="utf-8", errors="replace")
+        return (p.stdout or "").strip() if p.returncode == 0 else None
+
+    head = git("rev-parse", "HEAD")
+    remote = git("rev-parse", "--verify", "--quiet", f"refs/remotes/origin/{branch}")
+    if remote is not None and remote == head:
+        # Already pushed: `git push` will say "Everything up-to-date", and the
+        # only thing left to redo is the PR.
+        return True
+    if remote is not None:
+        counting = ["rev-list", "--count", f"origin/{branch}..HEAD"]
+    else:
+        # The push never landed, so there is no remote branch to compare against:
+        # only a commit that no remote has at all is worth finishing.
+        counting = ["rev-list", "--count", "HEAD", "--not", "--remotes"]
+    count = git(*counting)
+    return bool(count) and int(count) > 0
+
+
 def commit_and_push(worktree: Path, branch: str, message: str) -> str:
-    """Commit everything in the worktree and push the branch. Returns the commit sha."""
+    """Commit everything in the worktree and push the branch. Returns the commit sha.
+
+    Idempotent after a half success (#40 T2): when an earlier attempt already
+    committed -- with or without the push -- and only `open_pr` failed, re-running
+    finishes the job and returns that commit instead of refusing. A clean worktree
+    with no commit of its own is still a real no-op and still raises.
+    """
     _run(["git", "add", "-A"], worktree)
     rc = subprocess.run(["git", "diff", "--cached", "--quiet"], cwd=str(worktree)).returncode
     if rc == 0:
-        raise RuntimeError("worktree 里没有可提交的改动")
+        # "Nothing staged" is not "nothing happened": the first real run committed
+        # and pushed, then died in `open_pr`, and every retry tripped over this
+        # guard with the commit sitting on the remote (#40 T2).
+        if not _already_committed(worktree, branch):
+            raise RuntimeError("worktree 里没有可提交的改动")
+        sha = _run(["git", "rev-parse", "--short", "HEAD"], worktree)
+        # Pushing an already-pushed commit exits 0 ("Everything up-to-date"), so
+        # the recovery path is safe to take whenever the commit exists: it either
+        # closes the missing push or does nothing.
+        _run(["git", "push", "-u", "origin", branch], worktree, timeout=300)
+        return sha
     _run(["git", "commit", "-m", message], worktree)
     sha = _run(["git", "rev-parse", "--short", "HEAD"], worktree)
     _run(["git", "push", "-u", "origin", branch], worktree, timeout=300)
@@ -180,7 +268,9 @@ def _selftest() -> int:
         _run(["git", "push", "-q", "-u", "origin", "HEAD:refs/heads/main"], work)
         _run(["git", "checkout", "-q", "-b", "wick/issue-9-run-9"], work)
 
-        # No changes yet: committing must refuse rather than create an empty commit.
+        # T2 (#40): three clean-worktree states, and only one of them is a no-op.
+        # Control 1 -- nothing happened at all: the branch is fresh, never pushed,
+        # and has no commit of its own, so an empty commit would be a lie.
         try:
             commit_and_push(work, "wick/issue-9-run-9", "empty")
         except RuntimeError as e:
@@ -195,6 +285,49 @@ def _selftest() -> int:
         # The branch really landed on the remote.
         out = _run(["git", "ls-remote", "--heads", str(bare)], tmp)
         assert "wick/issue-9-run-9" in out, out
+
+        # Control 2 -- the reported half success: commit AND push landed, only
+        # `open_pr` died. Clean worktree, HEAD == origin/<branch>. This is the
+        # state the first real run was stuck in: it used to raise "没有可提交的
+        # 改动" forever. It must hand back the same sha so the PR step can run.
+        # Drop the equality case in _already_committed and this goes red.
+        pushed_sha = _run(["git", "rev-parse", "HEAD"], work)
+        commits_before_retry = _run(["git", "rev-list", "--count", "HEAD"], work)
+        assert _run(["git", "rev-parse", "origin/wick/issue-9-run-9"], work) == pushed_sha, \
+            "前置条件：push 已经落地"
+        retried = commit_and_push(work, "wick/issue-9-run-9", "半成功后重跑")
+        assert retried == sha, f"重跑应该返回已有的 commit {sha!r}，而不是 {retried!r}"
+        assert _run(["git", "rev-parse", "HEAD"], work) == pushed_sha, "恢复路径不能改动 HEAD"
+        assert _run(["git", "rev-list", "--count", "HEAD"], work) == commits_before_retry, \
+            "恢复路径不能凭空多造一个 commit"
+
+        # Control 3 -- commit landed, push did not. Same clean worktree, but HEAD
+        # is ahead of origin/<branch>: recover and finish the push.
+        (work / "a.py").write_text("x = 3\n", encoding="utf-8")
+        _run(["git", "commit", "-qam", "本地已提交，但 push 没成功"], work)
+        ahead_sha = _run(["git", "rev-parse", "HEAD"], work)
+        commits_before = _run(["git", "rev-list", "--count", "HEAD"], work)
+        assert _already_committed(work, "wick/issue-9-run-9"), "HEAD 已领先 origin，应该认得出来"
+        recovered = commit_and_push(work, "wick/issue-9-run-9", "恢复路径不该再提交")
+        assert recovered == _run(["git", "rev-parse", "--short", "HEAD"], work), recovered
+        assert _run(["git", "rev-list", "--count", "HEAD"], work) == commits_before, \
+            "恢复路径不能凭空多造一个 commit"
+        assert ahead_sha in _run(["git", "ls-remote", "--heads", str(bare)], tmp), \
+            "恢复路径没有把已有的 commit push 上去，后面的 open_pr 还是会失败"
+
+        # Control 4 -- the branch was never pushed at all, so there is no
+        # origin/<branch> to compare against: the commit has to be found via
+        # "no remote has it". Delete that fallback and this goes red.
+        _run(["git", "checkout", "-q", "-b", "wick/issue-9-run-10"], work)
+        (work / "a.py").write_text("x = 4\n", encoding="utf-8")
+        _run(["git", "commit", "-qam", "分支还没推过"], work)
+        never_pushed = _run(["git", "rev-parse", "HEAD"], work)
+        assert _already_committed(work, "wick/issue-9-run-10"), \
+            "从未 push 过的分支上已经有 commit，应该认得出来"
+        assert commit_and_push(work, "wick/issue-9-run-10", "恢复路径不该再提交") == \
+            _run(["git", "rev-parse", "--short", "HEAD"], work)
+        assert never_pushed in _run(["git", "ls-remote", "--heads", str(bare)], tmp), \
+            "从未 push 过的分支，恢复路径应该把已有的 commit 推上去"
 
         # Unknown action is refused before touching anything.
         try:
@@ -260,8 +393,72 @@ def _selftest() -> int:
     assert _ref_suffix(None) == "" and _ref_suffix("?") == "" and _ref_suffix("") == ""
     assert _ref_suffix(12) == " (#12)"
 
+    # T1 (#40): gh must reach api.github.com directly, git push must keep the
+    # proxy. Two stub programs named exactly `gh` and `git` print the env their
+    # child actually received -- asserting on _child_env() alone would stay green
+    # if _run() stopped passing it down. No network: the question is env, not reach.
+    import shutil
+
+    def _stub_program(folder: Path, name: str) -> str:
+        """An executable literally named `name` that dumps its own environment.
+
+        The rule keys on the executable, so a stub with another name would prove
+        nothing. Windows' printenv.exe prints the env whoever calls it, so a copy
+        renamed `gh.exe` is still printenv -- that is the stub there.
+
+        On POSIX that trick is wrong: printenv is a multi-call binary (GNU
+        coreutils, busybox) that dispatches on argv[0]. Copied to `gh` it looks
+        itself up as "gh", fails with `coreutils: unknown program 'gh'`, and the
+        check ends up asserting coreutils' program table instead of the env --
+        green on Windows, red on CI. A shebang script names printenv in its body,
+        so what the file is called cannot matter. Written as bytes, not text: a
+        CRLF after the shebang would break it on Linux.
+        """
+        if os.name == "nt":
+            src = shutil.which("printenv")
+            if not src:
+                raise RuntimeError("selftest 需要 printenv（git 自带）")
+            dst = folder / (name + ".exe")
+            shutil.copy2(src, dst)
+            return str(dst)
+        dst = folder / name
+        dst.write_bytes(b"#!/bin/sh\nexec printenv\n")
+        dst.chmod(0o755)
+        return str(dst)
+
+    def _env_of(dump: str) -> dict:
+        """Parse `printenv` output into env vars, uppercased.
+
+        Windows env blocks are case-insensitive, so a child that was handed both
+        NO_PROXY and no_proxy may only see one of them; comparing uppercase keys
+        keeps the check about the value, not the spelling the OS happened to keep.
+        """
+        pairs = (line.split("=", 1) for line in dump.splitlines() if "=" in line)
+        return {k.upper(): v for k, v in pairs}
+
+    global PROXY
+    saved_proxy = PROXY
+    PROXY = "http://127.0.0.1:7890"  # pinned: this check is about the env shape
+    saved_np = {k: os.environ.pop(k) for k in ("NO_PROXY", "no_proxy") if k in os.environ}
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            gh_env = _env_of(_run([_stub_program(tmp, "gh")], tmp))
+            git_env = _env_of(_run([_stub_program(tmp, "git")], tmp))
+        assert GH_DIRECT_HOST in gh_env.get("NO_PROXY", ""), (
+            f"gh 子进程的 NO_PROXY 里没有 {GH_DIRECT_HOST}：{gh_env.get('NO_PROXY')!r}")
+        assert "NO_PROXY" not in git_env, (
+            f"git 子进程不该排除代理（git push 要走代理），却拿到 NO_PROXY={git_env.get('NO_PROXY')!r}")
+        # Both still see the proxy: T1 is an exemption for one host, not "drop it".
+        assert gh_env.get("HTTPS_PROXY") and git_env.get("HTTPS_PROXY"), (
+            f"两边都应该拿到代理：gh={gh_env.get('HTTPS_PROXY')!r} git={git_env.get('HTTPS_PROXY')!r}")
+    finally:
+        PROXY = saved_proxy
+        os.environ.update(saved_np)
+
     print("actions.py selftest OK: 空提交拒绝 / commit+push 落地 / 未知动作拒绝 / "
-          "commit 前缀按 label / PR body 四节（含无 review 时的未填写） / 无编号时不写 Closes #?")
+          "commit 前缀按 label / PR body 四节（含无 review 时的未填写） / 无编号时不写 Closes #? / "
+          "半成功后重跑能恢复（干净且真没改动仍拒绝） / gh 的 NO_PROXY 含 api.github.com 而 git 不含")
     return 0
 
 
