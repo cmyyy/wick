@@ -7,7 +7,15 @@ on:
 
 jobs:
   selftest:
-    runs-on: ubuntu-latest
+    strategy:
+      # Do not cancel the other platform when one fails. The reason there are two
+      # legs is PR #41: a check passed on Windows and died on Linux because
+      # coreutils dispatches on argv[0], and the local run could not show it. A
+      # cancelled job would hide exactly the disagreement this matrix exists for.
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
     # Default is six hours. This repo just spent a round on "a handler that hangs
     # forever", so a hanging job here is not hypothetical.
     timeout-minutes: 5
