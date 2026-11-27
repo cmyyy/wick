@@ -79,44 +79,60 @@ def _run(args: list[str], cwd: Path | str, timeout: int = 180) -> str:
     return out
 
 
-def _unpublished_ahead(worktree: Path, branch: str) -> bool:
-    """Does HEAD carry commits that origin/<branch> does not have yet?
+def _already_committed(worktree: Path, branch: str) -> bool:
+    """Does HEAD already carry the commit this approval was meant to make?
 
-    Needed because "nothing staged" stopped meaning "nothing happened" (#40 T2):
-    a half-successful approval commits and pushes, then dies in `open_pr`, and the
-    next run finds a clean worktree whose commit is real and merely unpublished.
-    Comparing against the branch's own remote ref -- not "any remote" -- is what
-    keeps a branch freshly cut from main in the "nothing happened" bucket.
+    The "nothing staged" branch below is reached in three states, and only the
+    last one is a real no-op (#40 T2):
+
+    * `origin/<branch>` == HEAD: the commit AND the push landed and only
+      `open_pr` died. This is the state the first real run got stuck in --
+      re-running used to raise forever with the work already on the remote --
+      so it must hand back that sha for the PR step.
+    * HEAD ahead of `origin/<branch>` (or of every remote, when the push never
+      landed): the commit exists, the push does not; finish it.
+    * neither: nothing was committed here at all, and an empty commit would lie.
+
+    A branch freshly cut from main has no `origin/<branch>` and no commit of its
+    own, so it stays in the last bucket even though HEAD == origin/main. That is
+    why the comparison is against the branch's own remote ref, not "any remote".
     """
-    remote = subprocess.run(
-        ["git", "rev-parse", "--verify", "--quiet", f"refs/remotes/origin/{branch}"],
-        cwd=str(worktree), capture_output=True, text=True,
-        encoding="utf-8", errors="replace")
-    if remote.returncode == 0:
+    def git(*args: str) -> str | None:
+        p = subprocess.run(["git", *args], cwd=str(worktree), capture_output=True,
+                           text=True, encoding="utf-8", errors="replace")
+        return (p.stdout or "").strip() if p.returncode == 0 else None
+
+    head = git("rev-parse", "HEAD")
+    remote = git("rev-parse", "--verify", "--quiet", f"refs/remotes/origin/{branch}")
+    if remote is not None and remote == head:
+        # Already pushed: `git push` will say "Everything up-to-date", and the
+        # only thing left to redo is the PR.
+        return True
+    if remote is not None:
         counting = ["rev-list", "--count", f"origin/{branch}..HEAD"]
     else:
         # The push never landed, so there is no remote branch to compare against:
         # only a commit that no remote has at all is worth finishing.
         counting = ["rev-list", "--count", "HEAD", "--not", "--remotes"]
-    p = subprocess.run(["git", *counting], cwd=str(worktree), capture_output=True,
-                       text=True, encoding="utf-8", errors="replace")
-    if p.returncode != 0:
-        return False
-    return int((p.stdout or "0").strip() or 0) > 0
+    count = git(*counting)
+    return bool(count) and int(count) > 0
 
 
 def commit_and_push(worktree: Path, branch: str, message: str) -> str:
     """Commit everything in the worktree and push the branch. Returns the commit sha.
 
     Idempotent after a half success (#40 T2): when an earlier attempt already
-    committed (and pushed) and only `open_pr` failed, re-running finishes the push
-    and returns that commit instead of refusing. A clean worktree with nothing
-    ahead of the remote is still a real no-op and still raises.
+    committed -- with or without the push -- and only `open_pr` failed, re-running
+    finishes the job and returns that commit instead of refusing. A clean worktree
+    with no commit of its own is still a real no-op and still raises.
     """
     _run(["git", "add", "-A"], worktree)
     rc = subprocess.run(["git", "diff", "--cached", "--quiet"], cwd=str(worktree)).returncode
     if rc == 0:
-        if not _unpublished_ahead(worktree, branch):
+        # "Nothing staged" is not "nothing happened": the first real run committed
+        # and pushed, then died in `open_pr`, and every retry tripped over this
+        # guard with the commit sitting on the remote (#40 T2).
+        if not _already_committed(worktree, branch):
             raise RuntimeError("worktree 里没有可提交的改动")
         sha = _run(["git", "rev-parse", "--short", "HEAD"], worktree)
         # Pushing an already-pushed commit exits 0 ("Everything up-to-date"), so
@@ -252,7 +268,9 @@ def _selftest() -> int:
         _run(["git", "push", "-q", "-u", "origin", "HEAD:refs/heads/main"], work)
         _run(["git", "checkout", "-q", "-b", "wick/issue-9-run-9"], work)
 
-        # No changes yet: committing must refuse rather than create an empty commit.
+        # T2 (#40): three clean-worktree states, and only one of them is a no-op.
+        # Control 1 -- nothing happened at all: the branch is fresh, never pushed,
+        # and has no commit of its own, so an empty commit would be a lie.
         try:
             commit_and_push(work, "wick/issue-9-run-9", "empty")
         except RuntimeError as e:
@@ -268,29 +286,48 @@ def _selftest() -> int:
         out = _run(["git", "ls-remote", "--heads", str(bare)], tmp)
         assert "wick/issue-9-run-9" in out, out
 
-        # T2 (#40): the half-success state -- committed and pushed, `open_pr` died
-        # -- leaves a clean worktree. Re-running used to fail forever on
-        # "没有可提交的改动", with no way back to the PR step.
-        # Control 1: clean AND nothing ahead of origin is still a real no-op.
-        try:
-            commit_and_push(work, "wick/issue-9-run-9", "不该提交")
-        except RuntimeError as e:
-            assert "没有可提交的改动" in str(e), e
-        else:
-            raise AssertionError("worktree 干净且与 origin 一致时应该拒绝，而不是返回 sha")
+        # Control 2 -- the reported half success: commit AND push landed, only
+        # `open_pr` died. Clean worktree, HEAD == origin/<branch>. This is the
+        # state the first real run was stuck in: it used to raise "没有可提交的
+        # 改动" forever. It must hand back the same sha so the PR step can run.
+        # Drop the equality case in _already_committed and this goes red.
+        pushed_sha = _run(["git", "rev-parse", "HEAD"], work)
+        commits_before_retry = _run(["git", "rev-list", "--count", "HEAD"], work)
+        assert _run(["git", "rev-parse", "origin/wick/issue-9-run-9"], work) == pushed_sha, \
+            "前置条件：push 已经落地"
+        retried = commit_and_push(work, "wick/issue-9-run-9", "半成功后重跑")
+        assert retried == sha, f"重跑应该返回已有的 commit {sha!r}，而不是 {retried!r}"
+        assert _run(["git", "rev-parse", "HEAD"], work) == pushed_sha, "恢复路径不能改动 HEAD"
+        assert _run(["git", "rev-list", "--count", "HEAD"], work) == commits_before_retry, \
+            "恢复路径不能凭空多造一个 commit"
 
-        # Control 2: same clean worktree, but HEAD is ahead of origin -> recover.
+        # Control 3 -- commit landed, push did not. Same clean worktree, but HEAD
+        # is ahead of origin/<branch>: recover and finish the push.
         (work / "a.py").write_text("x = 3\n", encoding="utf-8")
         _run(["git", "commit", "-qam", "本地已提交，但 push 没成功"], work)
         ahead_sha = _run(["git", "rev-parse", "HEAD"], work)
         commits_before = _run(["git", "rev-list", "--count", "HEAD"], work)
-        assert _unpublished_ahead(work, "wick/issue-9-run-9"), "HEAD 已领先 origin，应该认得出来"
+        assert _already_committed(work, "wick/issue-9-run-9"), "HEAD 已领先 origin，应该认得出来"
         recovered = commit_and_push(work, "wick/issue-9-run-9", "恢复路径不该再提交")
         assert recovered == _run(["git", "rev-parse", "--short", "HEAD"], work), recovered
         assert _run(["git", "rev-list", "--count", "HEAD"], work) == commits_before, \
             "恢复路径不能凭空多造一个 commit"
         assert ahead_sha in _run(["git", "ls-remote", "--heads", str(bare)], tmp), \
             "恢复路径没有把已有的 commit push 上去，后面的 open_pr 还是会失败"
+
+        # Control 4 -- the branch was never pushed at all, so there is no
+        # origin/<branch> to compare against: the commit has to be found via
+        # "no remote has it". Delete that fallback and this goes red.
+        _run(["git", "checkout", "-q", "-b", "wick/issue-9-run-10"], work)
+        (work / "a.py").write_text("x = 4\n", encoding="utf-8")
+        _run(["git", "commit", "-qam", "分支还没推过"], work)
+        never_pushed = _run(["git", "rev-parse", "HEAD"], work)
+        assert _already_committed(work, "wick/issue-9-run-10"), \
+            "从未 push 过的分支上已经有 commit，应该认得出来"
+        assert commit_and_push(work, "wick/issue-9-run-10", "恢复路径不该再提交") == \
+            _run(["git", "rev-parse", "--short", "HEAD"], work)
+        assert never_pushed in _run(["git", "ls-remote", "--heads", str(bare)], tmp), \
+            "从未 push 过的分支，恢复路径应该把已有的 commit 推上去"
 
         # Unknown action is refused before touching anything.
         try:
@@ -366,14 +403,27 @@ def _selftest() -> int:
         """An executable literally named `name` that dumps its own environment.
 
         The rule keys on the executable, so a stub with another name would prove
-        nothing. printenv is copied rather than synthesised: it ships with git on
-        every platform this runs on, and prints exactly what the child was given.
+        nothing. Windows' printenv.exe prints the env whoever calls it, so a copy
+        renamed `gh.exe` is still printenv -- that is the stub there.
+
+        On POSIX that trick is wrong: printenv is a multi-call binary (GNU
+        coreutils, busybox) that dispatches on argv[0]. Copied to `gh` it looks
+        itself up as "gh", fails with `coreutils: unknown program 'gh'`, and the
+        check ends up asserting coreutils' program table instead of the env --
+        green on Windows, red on CI. A shebang script names printenv in its body,
+        so what the file is called cannot matter. Written as bytes, not text: a
+        CRLF after the shebang would break it on Linux.
         """
-        src = shutil.which("printenv")
-        if not src:
-            raise RuntimeError("selftest 需要 printenv（git 自带）")
-        dst = folder / (name + (".exe" if os.name == "nt" else ""))
-        shutil.copy2(src, dst)
+        if os.name == "nt":
+            src = shutil.which("printenv")
+            if not src:
+                raise RuntimeError("selftest 需要 printenv（git 自带）")
+            dst = folder / (name + ".exe")
+            shutil.copy2(src, dst)
+            return str(dst)
+        dst = folder / name
+        dst.write_bytes(b"#!/bin/sh\nexec printenv\n")
+        dst.chmod(0o755)
         return str(dst)
 
     def _env_of(dump: str) -> dict:
@@ -408,7 +458,7 @@ def _selftest() -> int:
 
     print("actions.py selftest OK: 空提交拒绝 / commit+push 落地 / 未知动作拒绝 / "
           "commit 前缀按 label / PR body 四节（含无 review 时的未填写） / 无编号时不写 Closes #? / "
-          "半成功后重跑能恢复（干净且落后则拒绝） / gh 的 NO_PROXY 含 api.github.com 而 git 不含")
+          "半成功后重跑能恢复（干净且真没改动仍拒绝） / gh 的 NO_PROXY 含 api.github.com 而 git 不含")
     return 0
 
 

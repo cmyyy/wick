@@ -101,7 +101,7 @@ def _render(template: str, payload: dict,
         number=number if number is not None else "?",
         issue_ref=f"#{number}" if number is not None else "（手派任务，无编号）",
         title=payload.get("title") or "(无标题)",
-        url=payload.get("url", ""),
+        url=payload.get("url") or "",
         labels=labels,
         author=payload.get("author") or "(未知)",
         state=payload.get("state") or "(未知)",
@@ -509,7 +509,7 @@ def _selftest() -> int:
     for null_payload in (
             {"title": "x"},
             {"repo": "cmyyy/wick", "title": "x", "number": None},
-            {"repo": None, "title": None, "number": None}):
+            {"repo": None, "title": None, "number": None, "url": None}):
         for rendered in (render_issue_prompt(null_payload),
                          render_fix_prompt(null_payload, wt_path,
                                            "wick/issue-manual-run-1-attempt-1")):
