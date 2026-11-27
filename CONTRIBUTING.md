@@ -195,7 +195,7 @@ python eval/reliability.py --all      # 全跑，任一不通过就非零退出
 `eval/report.md` 是 `python eval/reliability.py --all` 的输出，它的判定列由脚本算出来。手改它会被抓出来：
 
 ```bash
-python eval/check-report.py            # 约 6 分钟：重跑 --all 到临时路径，比对判定列
+python eval/check-report.py            # 5 分钟量级（本机实测 4 分 55 秒）：重跑 --all 到临时路径，整份逐字比对
 python eval/check-report.py --selftest # 1 秒：只验解析器本身
 ```
 
@@ -213,12 +213,22 @@ python eval/check-report.py --selftest # 1 秒：只验解析器本身
 
 ## 自动跑的部分
 
-`.github/workflows/checks.yml` 在 PR 上跑全部自检（14 秒，无依赖、无网络）。不需要谁记得跑。
+`.github/workflows/checks.yml` 在 PR 和 push 到 `main` 时跑全部自检，矩阵两条腿：`ubuntu-latest` 和 `windows-latest`，`fail-fast: false`（一条红了另一条照跑，两条腿不一致正是要看的东西）。跑的是同一条 `python src/agent.py --checks`，所以往 `CHECKS` 里加一项，两条腿一起走。自检本身无依赖、不联网，本机 12/12 约 14 秒；runner 上多一步 `setup-python`。
+
+两条腿不是冗余，各自抓到过对方抓不到的东西：
+
+- PR #41：一个桩在 Windows 上绿、在 Linux 上红 —— Linux 的 `printenv` 是 coreutils 的多调用二进制，按 argv[0] 分派，改名成 `gh` 就找不到自己
+- Windows 腿第一次跑是 **11/12 红**，红的都是 `UnicodeEncodeError`：runner 控制台是 cp1252，装不下「12/12 通过」，本机 `sys.stdout.encoding` 是 utf-8 所以从来没露过。唯一绿的是 `eval/run.py --selftest` —— 它只印 ASCII（`selftest OK: diff_stats / touched_tests / hallucination_check`），cp1252 编得下；这正好说明根因是编码，不是那 11 条断言本身。现在 `PYTHONIOENCODING: utf-8` job 上设一次、`src/agent.py` 的 `run_checks` 里再钉一次
 
 **没进 CI 的两个**：
 
-- `eval/reliability.py --all` —— 约 6 分钟，要真起进程并 kill 子进程
-- `eval/check-report.py`（不带 `--selftest`）—— 它跑前者，而且**依赖 Windows 的 `taskkill /F /T`**（`--crash` 那一条用它制造真崩溃）。所以它注定进不了 ubuntu runner，不要试图塞进去
+- `eval/reliability.py --all` —— 5 分钟量级（本机实测 4 分 55 秒，慢机器上更久），要真起进程并 kill 子进程
+- `eval/check-report.py`（不带 `--selftest`）—— 它跑前者，所以也是 5 分钟量级（本机实测 4 分 55 秒）。**两个平台的 runner 都跑得了它**：`--crash` 要真 kill 掉 worker，Windows 上走 `taskkill /F /T`，非 Windows 上 `taskkill` 不在 PATH，`eval/reliability.py:193` 的 `except FileNotFoundError:` 转成 `os.kill(pid, SIGKILL)`，是同一条命令的等价物。不放进 CI 的原因只有一个：代价，见下。
+
+**为什么有了两条腿也没把第二条挪进去**：不是跑不了 —— 两条腿都跑得了（见上，SIGKILL 是 `taskkill` 的等价物）—— 是代价不对，两条：
+
+- **装不进现在这个 job**：它要重跑 `--all`，本机实测 4 分 55 秒，而 job 的 5 分钟预算里只剩 5 秒（`timeout-minutes: 5` 写在 `checks.yml`）—— 再算上 checkout 和 `setup-python`，runner 上必超，而被超时取消的 job 说不清卡在哪一步。要放就得单开一个 job 放宽超时。
+- **它是有条件的检查，不是每次 PR 都该付的钱**：只有改动 `eval/reliability.py` / `eval/report.md` / 影响可靠性结论的 `src/`（见上一节）才需要跑。14 秒的检查每次 push 跑两遍是划算的；一条 5 分钟量级的不是。
 
 两者都属于「改动了那几处才跑」的本机检查。
 
