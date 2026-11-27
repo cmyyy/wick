@@ -199,12 +199,24 @@ def leftover_of(text: str) -> str:
 
 def run_checks(worktree: Path, timeout: int = CHECK_TIMEOUT) -> dict:
     """Run the project's self-checks inside the worktree. This is the real verdict."""
+    # Every check prints Chinese ("12/12 通过"), and a Windows console defaults to
+    # code page cp1252, which cannot encode it -- all twelve died in
+    # UnicodeEncodeError before running an assertion (#42). This loop is the one
+    # entry point they share, so the encoding is pinned here instead of in twelve
+    # scripts. Set by us rather than inherited: with no PYTHONIOENCODING in the
+    # parent this still has to be utf-8. The parent decodes with encoding="utf-8"
+    # below, so only one spelling of the variable may reach the child -- on Windows
+    # PYTHONIOENCODING and pythonioencoding are the same variable, and a duplicate
+    # pair in the env block would contradict itself.
+    child_env = {k: v for k, v in os.environ.items() if k.upper() != "PYTHONIOENCODING"}
+    child_env["PYTHONIOENCODING"] = "utf-8"
     results = []
     for args in CHECKS:
         cmd = [sys.executable, *args]
         try:
             p = subprocess.run(cmd, cwd=str(worktree), capture_output=True, text=True,
-                               encoding="utf-8", errors="replace", timeout=timeout)
+                               encoding="utf-8", errors="replace", timeout=timeout,
+                               env=child_env)
             ok = p.returncode == 0
             tail = ((p.stdout or "") + (p.stderr or "")).strip().splitlines()[-3:]
         except subprocess.TimeoutExpired:
@@ -806,10 +818,47 @@ def _selftest() -> int:
         assert not checks["all_ok"] and checks["passed"] == total - 1, checks
         assert "src/db.py" in _checks_line(checks)
 
+    # #42: run_checks must hand the child PYTHONIOENCODING=utf-8 itself. Stub
+    # subprocess instead of trying to fake a cp1252 console (a real one is not
+    # reproducible here -- this machine's stdout is already utf-8). The parent's
+    # variable is removed first on purpose: inheriting it from os.environ would
+    # also satisfy "the key exists in env", which is the other way this assertion
+    # could pass while the CI failure stays.
+    seen_envs = []
+
+    class _FakeProc:
+        returncode, stdout, stderr = 0, "", ""
+
+    real_run = subprocess.run
+
+    def _fake_run(cmd, **kw):
+        seen_envs.append(kw.get("env"))
+        return _FakeProc()
+
+    popped = os.environ.pop("PYTHONIOENCODING", None)
+    subprocess.run = _fake_run
+    try:
+        with tempfile.TemporaryDirectory() as td2:
+            stub_result = run_checks(Path(td2))
+    finally:
+        subprocess.run = real_run
+        if popped is not None:
+            os.environ["PYTHONIOENCODING"] = popped
+    assert len(seen_envs) == len(CHECKS), f"桩只接到了 {len(seen_envs)} 次子进程"
+    assert stub_result["all_ok"], stub_result
+    for child_env in seen_envs:
+        assert child_env is not None, "run_checks 没给子进程传 env"
+        # Case-insensitive on purpose: Windows treats PYTHONIOENCODING and
+        # pythonioencoding as one variable, so a duplicate key is a second answer.
+        keys = [k for k in child_env if k.upper() == "PYTHONIOENCODING"]
+        assert keys == ["PYTHONIOENCODING"], f"env 里这个键有 {keys} 份"
+        assert child_env["PYTHONIOENCODING"] == "utf-8", child_env["PYTHONIOENCODING"]
+
     print("agent.py selftest OK: 模板渲染 / 判定解析 / 进度两槽且不是权威 / 下次跟进入队与去重 / 自检真能失败 / "
           "分析路径两轮看到上一轮报告 / fix 路径经 handle_issue_fix 注入上一轮文件·自检·遗留·patch / "
           "无编号不渲染 #? / number 为 null 时分支名与 prompt 里都没有 None / "
-          "0 改动不写审批 / 没加 --allow-code 改 src/ 会失败")
+          "0 改动不写审批 / 没加 --allow-code 改 src/ 会失败 / "
+          "run_checks 自己给子进程设 PYTHONIOENCODING=utf-8")
     return 0
 
 
