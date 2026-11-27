@@ -66,6 +66,19 @@ NO_PROGRESS = "（没有历史进度：这是这个任务的第一次运行）"
 _ACTION_LABEL = "提 PR"
 
 
+def _issue_number(payload: dict):
+    """The issue number from a payload, or None when the task has no number.
+
+    `payload.get("number")` is not enough on its own when deciding: a hand-queued
+    event (#30) carries `"number": null`, and `get("number", "?")` returns None
+    for that too -- the default only applies to a MISSING key. Both cases mean
+    "no number", and passing that None on produced `wick/issue-None-run-3-attempt-2`
+    and a prompt that said "None" (#40 T3).
+    """
+    number = payload.get("number")
+    return None if number in (None, "", "?") else number
+
+
 def _render(template: str, payload: dict,
             progress: tuple[str, str] = ("", ""), **extra) -> str:
     """Fill one template. `progress` is (index_text, task_text) from progress.load.
@@ -80,12 +93,14 @@ def _render(template: str, payload: dict,
     tpl = (PROMPT_DIR / template).read_text(encoding="utf-8")
     index_text, task_text = progress
     labels = ", ".join(payload.get("labels") or []) or "(无)"
-    number = payload.get("number")
+    number = _issue_number(payload)
     return tpl.format(
-        repo=payload.get("repo", "?"),
-        number=number if number else "?",
-        issue_ref=f"#{number}" if number else "（手派任务，无编号）",
-        title=payload.get("title", "(无标题)"),
+        # `or` rather than a default argument: these keys are present-and-null in
+        # hand-queued payloads, where a get(key, default) keeps the None (#40 T3).
+        repo=payload.get("repo") or "?",
+        number=number if number is not None else "?",
+        issue_ref=f"#{number}" if number is not None else "（手派任务，无编号）",
+        title=payload.get("title") or "(无标题)",
         url=payload.get("url", ""),
         labels=labels,
         author=payload.get("author") or "(未知)",
@@ -350,10 +365,13 @@ def handle_issue_fix(conn, event) -> str:
     import sandbox
 
     payload = json.loads(event["payload"] or "{}")
-    number = payload.get("number")
+    number = _issue_number(payload)
     task = progressmod.task_id(event)
     guard = (event["id"], event["attempts"], event["worker_id"])
-    worktree, branch = sandbox.create(PROJECT_ROOT, event["id"], number,
+    # sandbox.branch_name sanitizes `?` into `manual`; handing it the raw None
+    # f-string'd it into `wick/issue-None-run-3-attempt-2` (#40 T3).
+    worktree, branch = sandbox.create(PROJECT_ROOT, event["id"],
+                                      number if number is not None else "?",
                                       attempt=event["attempts"])
 
     run_error: Exception | None = None
@@ -483,6 +501,22 @@ def _selftest() -> int:
         assert "（手派任务，无编号）" in rendered, rendered[:300]
         assert "#?" not in rendered and "编号：#?" not in rendered
 
+    # T3 (#40): `"number": null` is NOT the same as a missing key -- get()'s
+    # default only fires when the key is absent, so a present-and-null value is
+    # rendered by str.format as the literal "None". The last payload is the one
+    # that actually leaked: the templates print {repo} and {title}, and a manual
+    # task may carry either as null.
+    for null_payload in (
+            {"title": "x"},
+            {"repo": "cmyyy/wick", "title": "x", "number": None},
+            {"repo": None, "title": None, "number": None}):
+        for rendered in (render_issue_prompt(null_payload),
+                         render_fix_prompt(null_payload, wt_path,
+                                           "wick/issue-manual-run-1-attempt-1")):
+            assert "None" not in rendered, \
+                f"payload 里值为 null（{sorted(null_payload)}）时渲染出了 None: {rendered[:300]}"
+            assert "（手派任务，无编号）" in rendered, rendered[:300]
+
     # Progress is a note written by a previous run, never an authority. Both
     # templates must say so: delete the sentence and this goes red.
     for rendered in (prompt, fix):
@@ -603,8 +637,10 @@ def _selftest() -> int:
                  sandbox.create, sandbox.diff)
         progressmod.PROGRESS_DIR = Path(td) / "progress"
         wt = Path(td) / "wt"
+        created: list = []  # what handle_issue_fix handed sandbox.create (#40 T3)
 
         def fake_create(repo, event_id, issue_number, base="HEAD", *, attempt):
+            created.append(issue_number)
             return wt, f"wick/issue-{issue_number}-run-{event_id}-attempt-{attempt}"
 
         def fake_fix_run(prompt, cwd=None, timeout=DEFAULT_TIMEOUT):
@@ -664,6 +700,30 @@ def _selftest() -> int:
             assert fconn.execute("SELECT COUNT(*) c FROM approvals WHERE event_id=?",
                                  (gate_event["id"],)).fetchone()["c"] == 0, \
                 "闸门命中时不该写审批"
+
+            # T3 (#40): a hand-queued event has `"number": null`, and
+            # payload.get("number") hands that None straight to sandbox.create --
+            # which f-string'd it into `wick/issue-None-run-3-attempt-2`. Drive the
+            # real handler so a revert of the fix (not just of the helper) goes red,
+            # then feed what it passed into the REAL branch_name and ask git.
+            nconn = dbmod.connect(":memory:")
+            for label, small_payload in (
+                    ("missing", {"repo": "cmyyy/wick", "title": "手派 A", "allow_code": True}),
+                    ("null", {"repo": "cmyyy/wick", "number": None, "title": "手派 B",
+                              "allow_code": True})):
+                dbmod.enqueue(nconn, "manual", f"manual:{label}", small_payload)
+                ev = dbmod.claim_next(nconn, "w-null")
+                assert ev is not None, label
+                created.clear()
+                handle_issue_fix(nconn, ev)
+                token = created[-1]
+                assert token is not None, f"{label}: number 为 null 时把 None 传给了 sandbox.create"
+                branch = sandbox.branch_name(ev["id"], token, ev["attempts"])
+                assert "None" not in branch, f"{label}: 分支名里出现了 None（{branch}）"
+                chk = subprocess.run(["git", "check-ref-format", "--branch", branch],
+                                     capture_output=True, text=True)
+                assert chk.returncode == 0, f"{label}: git 不接受的分支名 {branch}"
+            nconn.close()
         finally:
             (progressmod.PROGRESS_DIR, run_prompt, run_checks,
              sandbox.create, sandbox.diff) = saved
@@ -748,7 +808,8 @@ def _selftest() -> int:
 
     print("agent.py selftest OK: 模板渲染 / 判定解析 / 进度两槽且不是权威 / 下次跟进入队与去重 / 自检真能失败 / "
           "分析路径两轮看到上一轮报告 / fix 路径经 handle_issue_fix 注入上一轮文件·自检·遗留·patch / "
-          "无编号不渲染 #? / 0 改动不写审批 / 没加 --allow-code 改 src/ 会失败")
+          "无编号不渲染 #? / number 为 null 时分支名与 prompt 里都没有 None / "
+          "0 改动不写审批 / 没加 --allow-code 改 src/ 会失败")
     return 0
 
 
